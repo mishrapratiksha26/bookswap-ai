@@ -173,10 +173,16 @@ class AgentResponse(BaseModel):
     iterations: int          # how many loop cycles ran — used in Chapter 5 evaluation
 
 # ---------------------------------------------------------------------------
-# TOOL DEFINITIONS
-# Three tools defined as JSON schemas. The LLM receives these on every call
-# and autonomously decides which to invoke based on its reasoning state.
-# Two more tools (get_user_profile, search_pdfs) are added in Phase 6.
+# TOOL DEFINITIONS — 5 tools total.
+#
+# Tool 1: semantic_search      — vector search + re-ranking (Phase 4)
+# Tool 2: check_availability   — real-time borrow status from DB
+# Tool 3: get_alternatives     — similarity search for unavailable books
+# Tool 4: get_user_profile     — user taste vector + borrow history (Phase 5)
+# Tool 5: search_pdfs          — digital PDF library search (Phase 6)
+#
+# The LLM receives all 5 schemas on every /agent call and autonomously
+# decides which to invoke based on query type and observation state.
 # ---------------------------------------------------------------------------
 
 tools = [
@@ -184,13 +190,13 @@ tools = [
         "type": "function",
         "function": {
             "name": "semantic_search",
-            "description": "Search BookSwap inventory for books by topic, subject, or keyword",
+            "description": "Search BookSwap physical book inventory by topic, subject, or keyword. Returns re-ranked results combining semantic similarity, availability, ratings, and popularity.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query, e.g. 'beginner data structures'"
+                        "description": "Search query, e.g. 'beginner data structures' or 'psychological thriller'"
                     }
                 },
                 "required": ["query"]
@@ -201,14 +207,14 @@ tools = [
         "type": "function",
         "function": {
             "name": "check_availability",
-            "description": "Check if specific books are currently available to borrow on BookSwap",
+            "description": "Check if specific physical books are currently available to borrow on BookSwap. Always call this after semantic_search.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "book_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of book ID strings to check"
+                        "description": "List of book ID strings from semantic_search results"
                     }
                 },
                 "required": ["book_ids"]
@@ -219,16 +225,59 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_alternatives",
-            "description": "Find similar books to a specific book, useful when a book is unavailable",
+            "description": "Find similar books to a specific unavailable book. Call this when check_availability returns available=false for a book the user wants.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "book_id": {
                         "type": "string",
-                        "description": "The book ID to find alternatives for"
+                        "description": "The book ID of the unavailable book to find alternatives for"
                     }
                 },
                 "required": ["book_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_profile",
+            "description": "Retrieve a student's reading profile: borrowing history, ratings, and genre preferences. ALWAYS call this FIRST when the user asks for personalised recommendations or mentions 'based on my history / what I've read / for me'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "MongoDB ObjectId of the logged-in user (provided in the request context)"
+                    }
+                },
+                "required": ["user_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_pdfs",
+            "description": "Search the BookSwap digital PDF library (notes, textbooks, previous year papers, reference material). Call this when the user asks for soft copies, PDFs, notes, or study material.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query, e.g. 'operating systems notes' or 'DBMS previous year papers'"
+                    },
+                    "resource_type": {
+                        "type": "string",
+                        "enum": ["textbook", "notes", "previous_papers", "reference", "all"],
+                        "description": "Filter by resource type. Default 'all'."
+                    },
+                    "department": {
+                        "type": "string",
+                        "description": "Optional department filter, e.g. 'CSE', 'ECE', 'Mathematics'"
+                    }
+                },
+                "required": ["query"]
             }
         }
     }
@@ -286,6 +335,177 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
         except Exception:
             return []
 
+    elif tool_name == "get_user_profile":
+        # ---------------------------------------------------------------------------
+        # Profile-Augmented Retrieval (Phase 5 — Chapter 3.4 of thesis)
+        #
+        # Queries the user's borrowing history and review ratings to build:
+        #   1. genre_preferences dict  — e.g. {"FICTION": 4, "EDUCATIONAL": 2}
+        #   2. taste_summary string    — human-readable, fed back to LLM
+        #   3. taste_vector            — 384-dim weighted average of borrowed book
+        #                               embeddings (Σ rᵢ·vᵢ / Σ rᵢ), used for
+        #                               the δ·context component in re-ranking
+        #   4. books_already_seen      — filter these from future recommendations
+        #
+        # cold-start: if user has no borrows, returns empty lists + taste_vector=None
+        # ---------------------------------------------------------------------------
+        from bson import ObjectId
+        import numpy as np
+
+        user_id = tool_args.get("user_id")
+        if not user_id:
+            return {"error": "user_id required"}
+
+        try:
+            borrow_collection = db["borrowrequests"]
+            review_collection = db["reviews"]
+
+            # Fetch all borrow records for this user
+            borrows = list(borrow_collection.find({
+                "borrower": ObjectId(user_id),
+                "status": {"$in": ["approved", "returned"]}
+            }))
+
+            books_borrowed = []
+            genre_freq = {}
+            weighted_sum = None
+            total_weight = 0.0
+            seen_ids = []
+
+            for borrow in borrows:
+                book_id = borrow.get("book")
+                if not book_id:
+                    continue
+                book = books_collection.find_one({"_id": book_id})
+                if not book:
+                    continue
+
+                book_id_str = str(book["_id"])
+                seen_ids.append(book_id_str)
+
+                # Check if user has rated this book
+                review = review_collection.find_one({
+                    "author": ObjectId(user_id),
+                    "book": book_id
+                })
+                rating = float(review["rating"]) if review and review.get("rating") else 3.5
+
+                books_borrowed.append({
+                    "title": book.get("title", "Unknown"),
+                    "author": book.get("author", ""),
+                    "genre": book.get("genre", ""),
+                    "rating_given": rating
+                })
+
+                # Genre frequency counting
+                genre = book.get("genre", "").strip()
+                if genre:
+                    genre_freq[genre] = genre_freq.get(genre, 0) + 1
+
+                # Build rating-weighted sum for taste vector
+                # Formula: taste_vec = Σ(rᵢ · embed(bᵢ)) / Σ rᵢ  (Hu et al. 2008)
+                if "vector" in book and book["vector"]:
+                    vec = np.array(book["vector"])
+                    if weighted_sum is None:
+                        weighted_sum = vec * rating
+                    else:
+                        weighted_sum += vec * rating
+                    total_weight += rating
+
+            # Compute final taste vector
+            taste_vec = None
+            if weighted_sum is not None and total_weight > 0:
+                taste_vec = (weighted_sum / total_weight).tolist()
+
+            top_genres = sorted(genre_freq, key=genre_freq.get, reverse=True)[:3]
+
+            if books_borrowed:
+                taste_summary = (
+                    f"This student has borrowed {len(books_borrowed)} book(s). "
+                    f"Preferred genres: {', '.join(top_genres) if top_genres else 'varied'}. "
+                    f"Recent reads: {', '.join(b['title'] for b in books_borrowed[-3:])}."
+                )
+            else:
+                taste_summary = "New user — no borrowing history yet."
+
+            return {
+                "books_borrowed": books_borrowed,
+                "genre_preferences": genre_freq,
+                "top_genres": top_genres,
+                "taste_summary": taste_summary,
+                "taste_vector": taste_vec,        # returned to agent for context
+                "books_already_seen": seen_ids    # agent should exclude these
+            }
+
+        except Exception as e:
+            return {"error": f"Could not load profile: {str(e)}"}
+
+    elif tool_name == "search_pdfs":
+        # ---------------------------------------------------------------------------
+        # PDF Library Search (Phase 6 — System 2: Digital Resource Library)
+        #
+        # Searches the `pdfs` collection using vector similarity.
+        # Falls back to MongoDB text search if no vectors exist yet.
+        # Filters by resource_type and department if provided.
+        # ---------------------------------------------------------------------------
+        pdfs_collection = db["pdfs"]
+        query = tool_args.get("query", "")
+        resource_type = tool_args.get("resource_type", "all")
+        department = tool_args.get("department")
+
+        # Build filter
+        mongo_filter = {}
+        if resource_type and resource_type != "all":
+            mongo_filter["resource_type"] = resource_type
+        if department:
+            mongo_filter["department"] = {"$regex": department, "$options": "i"}
+
+        all_pdfs = list(pdfs_collection.find(mongo_filter))
+
+        if not all_pdfs:
+            return []
+
+        # Vector search if embeddings exist
+        pdfs_with_vectors = [p for p in all_pdfs if p.get("embedding")]
+        if pdfs_with_vectors:
+            from app.embeddings import generate_embedding
+            from sklearn.metrics.pairwise import cosine_similarity
+            import numpy as np
+
+            query_vec = np.array([generate_embedding(query)])
+            results = []
+            for pdf in pdfs_with_vectors:
+                pdf_vec = np.array([pdf["embedding"]])
+                score = float(cosine_similarity(query_vec, pdf_vec)[0][0])
+                results.append({
+                    "_id": str(pdf["_id"]),
+                    "title": pdf.get("title", "Unknown"),
+                    "subject": pdf.get("subject", ""),
+                    "course": pdf.get("course", ""),
+                    "professor": pdf.get("professor", ""),
+                    "department": pdf.get("department", ""),
+                    "resource_type": pdf.get("resource_type", ""),
+                    "cloudinary_url": pdf.get("cloudinary_url", ""),
+                    "description": pdf.get("description", ""),
+                    "download_count": pdf.get("download_count", 0),
+                    "score": round(score, 4)
+                })
+            results.sort(key=lambda x: x["score"], reverse=True)
+            return [r for r in results if r["score"] > 0.1][:5]
+
+        # Fallback: return first 5 matching by filter (no vector yet)
+        results = []
+        for pdf in all_pdfs[:5]:
+            results.append({
+                "_id": str(pdf["_id"]),
+                "title": pdf.get("title", "Unknown"),
+                "subject": pdf.get("subject", ""),
+                "resource_type": pdf.get("resource_type", ""),
+                "cloudinary_url": pdf.get("cloudinary_url", ""),
+                "description": pdf.get("description", ""),
+            })
+        return results
+
     return {"error": f"Unknown tool: {tool_name}"}
 
 # ---------------------------------------------------------------------------
@@ -302,10 +522,19 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
 def run_react_loop(
     messages: list,
     available_tools: list,
-    max_iterations: int = 7
+    max_iterations: int = 7,
+    rerank_weights: dict = None
 ) -> tuple[str, List[str], int]:
+    """
+    Core ReAct agent loop (Yao et al. 2022).
 
+    State tracked across iterations:
+      taste_vector — set when get_user_profile is called; threaded into
+                     subsequent semantic_search calls for personalised re-ranking.
+                     This is what makes the agent profile-aware without hardcoding.
+    """
     tools_called = []
+    taste_vector = None   # updated when get_user_profile runs
 
     for iteration in range(1, max_iterations + 1):
         print(f"\n--- Iteration {iteration} ---")
@@ -322,15 +551,13 @@ def run_react_loop(
             error_msg = str(e)
             print(f"GROQ ERROR: {error_msg}")
             if "rate_limit" in error_msg or "429" in error_msg:
-                return "I'm a bit busy right now 😅 Please try again in a few minutes!", tools_called, iteration
-            # Non-rate-limit error: skip this iteration and try again
+                return "I'm a bit busy right now, please try again in a few minutes!", tools_called, iteration
             continue
 
         msg = response.choices[0].message
 
         # No tool calls means LLM has enough information to answer
         if not msg.tool_calls:
-            # encode to ASCII to avoid Windows cp1252 emoji crash in console logs
             preview = (msg.content or '')[:200].encode('ascii', errors='replace').decode('ascii')
             print(f"FINAL: {preview}")
             return msg.content or "I couldn't find an answer. Please try again.", tools_called, iteration
@@ -346,13 +573,25 @@ def run_react_loop(
             print(f"TOOL: {tool_name}({tool_args})")
             tools_called.append(tool_name)
 
-            result = execute_tool(tool_name, tool_args)
-            print(f"RESULT: {json.dumps(result)[:300]}")
+            # Pass taste_vector + rerank_weights into semantic_search
+            # so re-ranking can use the user's profile if available
+            result = execute_tool(
+                tool_name, tool_args,
+                taste_vector=taste_vector,
+                rerank_weights=rerank_weights
+            )
+
+            # If get_user_profile returned a taste_vector, capture it for
+            # subsequent semantic_search calls in this same session
+            if tool_name == "get_user_profile" and isinstance(result, dict):
+                taste_vector = result.get("taste_vector")  # may be None (cold start)
+
+            print(f"RESULT: {json.dumps(result, default=str)[:300]}")
 
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
-                "content": json.dumps(result)
+                "content": json.dumps(result, default=str)
             })
 
     # Safety fallback — should rarely trigger with well-formed queries
