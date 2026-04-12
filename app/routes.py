@@ -1,10 +1,12 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
+from typing import Optional, List
 from app.search import get_similar_books, search_books, get_personal_recommendations
 from app.embeddings import generate_embedding
 from pymongo import MongoClient
 import os
 import json
+import uuid
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -18,7 +20,38 @@ books_collection = db["books"]
 
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# --- Models ---
+# ---------------------------------------------------------------------------
+# SYSTEM PROMPT — extracted as a constant so Phase 5 (hybrid prompt upgrade)
+# and Phase 11 (evaluation: swap v1/v2/v3/v4) can swap this in one place.
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are BookSwap AI — a friendly book assistant for students 😊
+
+TOOLS AVAILABLE:
+- semantic_search: Search books by topic or keyword
+- check_availability: Check if books can be borrowed
+- get_alternatives: Find similar books when one is unavailable
+
+RULES:
+1. ALWAYS search before recommending. NEVER make up book names.
+2. After searching, check availability of ALL found books. Show available books first.
+   For unavailable books that are a strong match, still show them with ❌ and try get_alternatives.
+3. If a book is unavailable and get_alternatives returns nothing, say "No alternative right now, check back later! 😅"
+4. NEVER show book IDs, tool names, JSON, or function calls to the user.
+5. NEVER recommend books, courses, or websites not in the inventory.
+6. For vague queries ("good books", "easy reads"), ask the user's preferred genre BEFORE searching.
+7. Only show books that match the user's request. No DSA books for someone wanting thrillers.
+8. For unavailable books, show ❌ and if a returnDate is provided, say "Expected back by [returnDate]".
+
+RESPONSE STYLE:
+- Warm and fun, like a helpful librarian 📚
+- 1-2 sentence summary per book using its description
+- ✅ Available  ❌ Unavailable
+- End with a follow-up question 😊"""
+
+# ---------------------------------------------------------------------------
+# PYDANTIC MODELS
+# ---------------------------------------------------------------------------
 
 class SearchRequest(BaseModel):
     query: str
@@ -44,8 +77,21 @@ class EmbedRequest(BaseModel):
 
 class AgentRequest(BaseModel):
     message: str
+    user_id: Optional[str] = None      # MongoDB ObjectId string — who is asking
+    session_id: Optional[str] = None   # UUID — which conversation this belongs to
 
-# --- Agent Tool Definitions ---
+class AgentResponse(BaseModel):
+    response: str
+    session_id: str          # echoed back so the frontend can store it
+    tools_called: List[str]  # ordered list: e.g. ["semantic_search", "check_availability"]
+    iterations: int          # how many loop cycles ran — used in Chapter 5 evaluation
+
+# ---------------------------------------------------------------------------
+# TOOL DEFINITIONS
+# Three tools defined as JSON schemas. The LLM receives these on every call
+# and autonomously decides which to invoke based on its reasoning state.
+# Two more tools (get_user_profile, search_pdfs) are added in Phase 6.
+# ---------------------------------------------------------------------------
 
 tools = [
     {
@@ -102,9 +148,12 @@ tools = [
     }
 ]
 
-# --- Agent Tool Executor ---
+# ---------------------------------------------------------------------------
+# TOOL EXECUTOR
+# Maps tool names from the LLM's JSON output to actual Python functions.
+# ---------------------------------------------------------------------------
 
-def execute_tool(tool_name, tool_args):
+def execute_tool(tool_name: str, tool_args: dict):
     if tool_name == "semantic_search":
         books = list(books_collection.find({}))
         results = search_books(tool_args["query"], books, 5)
@@ -135,7 +184,6 @@ def execute_tool(tool_name, tool_args):
                 continue
         return results
 
-
     elif tool_name == "get_alternatives":
         from bson import ObjectId
         try:
@@ -147,79 +195,66 @@ def execute_tool(tool_name, tool_args):
         except Exception:
             return []
 
-# --- Agent Endpoint ---
+    return {"error": f"Unknown tool: {tool_name}"}
 
-@router.post("/agent")
-def agent(request: AgentRequest):
-    messages = [
-        {
-            "role": "system",
-           "content": """You are BookSwap AI — a friendly book assistant for students 😊
+# ---------------------------------------------------------------------------
+# REACT LOOP — extracted as a standalone function.
+#
+# Why extracted? The /evaluate endpoint (Phase 11) calls this function
+# directly for 35 test queries without going through HTTP. If the loop
+# lived inside the route handler, the evaluation would need to make HTTP
+# calls to itself — circular and fragile.
+#
+# Returns: (response_text, tools_called, iteration_count)
+# ---------------------------------------------------------------------------
 
-            TOOLS AVAILABLE:
-            - semantic_search: Search books by topic or keyword
-            - check_availability: Check if books can be borrowed
-            - get_alternatives: Find similar books when one is unavailable
+def run_react_loop(
+    messages: list,
+    available_tools: list,
+    max_iterations: int = 7
+) -> tuple[str, List[str], int]:
 
-            RULES:
-            1. ALWAYS search before recommending. NEVER make up book names.
-            2. After searching, check availability of ALL found books. Show available books first. For unavailable books that are a strong match for the user's query, still show them with ❌ and try get_alternatives. Do not hide highly relevant books just because they are unavailable — the user should know they exist.
-            3. If a book is unavailable and get_alternatives returns nothing, say "No alternative right now, check back later! 😅"
-            4. NEVER show book IDs, tool names, JSON, or function calls to the user.
-            5. NEVER recommend books, courses, or websites not in the inventory.
-            6. For vague queries ("good books", "easy reads"), ask the user's preferred genre BEFORE searching.
-            7. Only show books that match the user's request. No DSA books for someone wanting thrillers.
-            8. For unavailable books, show ❌ and if a returnDate is provided, say "Expected back by [returnDate]". If no returnDate, say "Check back later!"
+    tools_called = []
 
-            RESPONSE STYLE:
-            - Warm and fun, like a helpful librarian 📚
-            - 1-2 sentence summary per book using its description
-            - ✅ Available  ❌ Unavailable
-            - End with a follow-up question 😊"""
+    for iteration in range(1, max_iterations + 1):
+        print(f"\n--- Iteration {iteration} ---")
 
-        },
-        {
-            "role": "user",
-            "content": request.message
-        }
-    ]
-
-    max_iterations = 7
-    for i in range(max_iterations):
-        print(f"\n--- Loop {i+1} ---")
-        
         try:
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
-                tools=tools,
+                tools=available_tools,
                 tool_choice="auto",
-                temperature=0  # reproducibility — evaluation results must be deterministic
+                temperature=0       # deterministic — identical input → identical output
             )
         except Exception as e:
             error_msg = str(e)
             print(f"GROQ ERROR: {error_msg}")
             if "rate_limit" in error_msg or "429" in error_msg:
-                return {"response": "I'm a bit busy right now 😅 Please try again in a few minutes!"}
+                return "I'm a bit busy right now 😅 Please try again in a few minutes!", tools_called, iteration
+            # Non-rate-limit error: skip this iteration and try again
             continue
-
-
 
         msg = response.choices[0].message
 
+        # No tool calls means LLM has enough information to answer
         if not msg.tool_calls:
-            print(f"FINAL RESPONSE: {msg.content[:200]}")
-            return {"response": msg.content}
+            print(f"FINAL: {(msg.content or '')[:200]}")
+            return msg.content or "I couldn't find an answer. Please try again.", tools_called, iteration
 
+        # Append assistant message (with its tool_calls) to conversation history
         messages.append(msg)
 
+        # Execute each tool the LLM requested and feed results back
         for tool_call in msg.tool_calls:
             tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
-            print(f"TOOL CALL: {tool_name}({tool_args})")
+
+            print(f"TOOL: {tool_name}({tool_args})")
+            tools_called.append(tool_name)
 
             result = execute_tool(tool_name, tool_args)
-            print(f"TOOL RESULT: {json.dumps(result)[:300]}")
+            print(f"RESULT: {json.dumps(result)[:300]}")
 
             messages.append({
                 "role": "tool",
@@ -227,14 +262,43 @@ def agent(request: AgentRequest):
                 "content": json.dumps(result)
             })
 
-    return {"response": "Sorry, I could not complete your request."}
+    # Safety fallback — should rarely trigger with well-formed queries
+    return "Sorry, I wasn't able to complete your request. Please try rephrasing.", tools_called, max_iterations
 
+# ---------------------------------------------------------------------------
+# AGENT ENDPOINT
+# ---------------------------------------------------------------------------
 
-# --- Existing Endpoints ---
+@router.post("/agent", response_model=AgentResponse)
+def agent(request: AgentRequest):
+    # Assign or preserve session_id — frontend stores this in sessionStorage
+    # and sends it back on the next turn for conversation continuity (Phase 8)
+    session_id = request.session_id or str(uuid.uuid4())
+
+    # Build the initial messages list.
+    # System prompt is first — this is the "instruction layer" the LLM reads
+    # before the user's message. Extracted to SYSTEM_PROMPT constant above
+    # so Phase 5 (prompt upgrade) and Phase 11 (evaluation) can swap it easily.
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": request.message}
+    ]
+
+    response_text, tools_called, iterations = run_react_loop(messages, tools)
+
+    return AgentResponse(
+        response=response_text,
+        session_id=session_id,
+        tools_called=tools_called,
+        iterations=iterations
+    )
+
+# ---------------------------------------------------------------------------
+# EXISTING ENDPOINTS — unchanged
+# ---------------------------------------------------------------------------
 
 @router.post("/embed-all")
 def embed_all():
-    from bson import ObjectId
     count = 0
     for book in books_collection.find({}):
         text = f"{book.get('title', '')} {book.get('author', '')} {book.get('genre', '')} {book.get('description', '')}"
@@ -282,26 +346,16 @@ def similar_books(request: SimilarBooksRequest):
 @router.post("/recommend-personal")
 def recommend_personal(request: PersonalRecommendationRequest):
     from bson import ObjectId
-    
     weighted_books = []
     library_ids = []
-    
     for item in request.books:
         book = books_collection.find_one({"_id": ObjectId(item.book_id)})
-        print(f"book found: {book is not None}, has vector: {'vector' in book if book else False}")
         if not book or "vector" not in book:
             continue
-        weighted_books.append({
-            "vector": book["vector"],
-            "rating": item.rating
-        })
+        weighted_books.append({"vector": book["vector"], "rating": item.rating})
         library_ids.append(item.book_id)
-    
-    print(f"weighted_books after loop: {len(weighted_books)}")
-    
     if not weighted_books:
         return {"results": []}
-    
     all_books = list(books_collection.find({}))
     results = get_personal_recommendations(weighted_books, all_books, library_ids, request.top_k)
     return {"results": results}
@@ -332,7 +386,3 @@ def debug_vectors():
             "first_3_values": vec[:3] if vec else []
         })
     return {"books": results}
-
-# {
-#   "message": "i am a beginner in dsa suggest me good books and a roadmap to go from beginner to advance in dsa"
-# }
