@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional, List
-from app.search import get_similar_books, search_books, get_personal_recommendations
+from app.search import get_similar_books, search_books, get_personal_recommendations, rerank_books
 from app.embeddings import generate_embedding
 from pymongo import MongoClient
 import os
@@ -239,11 +239,16 @@ tools = [
 # Maps tool names from the LLM's JSON output to actual Python functions.
 # ---------------------------------------------------------------------------
 
-def execute_tool(tool_name: str, tool_args: dict):
+def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weights=None):
     if tool_name == "semantic_search":
         books = list(books_collection.find({}))
-        results = search_books(tool_args["query"], books, 5)
-        return results
+        # Step 1: semantic similarity search (returns up to 5*2 candidates for re-ranking)
+        candidates = search_books(tool_args["query"], books, top_k=10)
+        # Step 2: re-rank using 5-component formula (Phase 4)
+        # taste_vector is None for anonymous users — cold start gracefully defaults to 0.5
+        reranked = rerank_books(candidates, taste_vector=taste_vector, weights=rerank_weights)
+        # Return top 5 after re-ranking
+        return reranked[:5]
 
     elif tool_name == "check_availability":
         from bson import ObjectId
