@@ -3,10 +3,11 @@ from pydantic import BaseModel
 from typing import Optional, List
 from app.search import get_similar_books, search_books, get_personal_recommendations, rerank_books
 from app.embeddings import generate_embedding
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING
 import os
 import json
 import uuid
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -17,6 +18,19 @@ router = APIRouter()
 client = MongoClient(os.environ.get("DB_URL"))
 db = client[os.environ.get("DB_NAME", "books")]
 books_collection = db["books"]
+conversations_collection = db["conversations"]
+
+# TTL index on last_active — MongoDB auto-deletes sessions idle > 30 minutes.
+# This keeps the collection clean and ensures old conversation context doesn't
+# bleed into new sessions. Using get_or_create pattern to avoid duplicate index error.
+try:
+    conversations_collection.create_index(
+        [("last_active", ASCENDING)],
+        expireAfterSeconds=1800,   # 30 minutes
+        name="ttl_last_active"
+    )
+except Exception:
+    pass  # index already exists — safe to ignore
 
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
@@ -509,6 +523,156 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
     return {"error": f"Unknown tool: {tool_name}"}
 
 # ---------------------------------------------------------------------------
+# SESSION MEMORY (Phase 7 — Chapter 3.5 of thesis)
+#
+# Two layers of memory:
+#
+#   Session memory:    full turn history for current session, stored in MongoDB
+#                      `conversations` collection. Loaded at session start and
+#                      appended on every turn. Injected into Groq messages list
+#                      so the LLM sees the complete current conversation.
+#
+#   Persistent memory: context_summary from the user's most recent PAST session
+#                      is injected as a system note at the start of a new session.
+#                      Gives continuity across logins without a full history reload.
+#
+# Context compression: after 10 turns, summarise with Groq and store as
+#                      context_summary. Prevents token overflow for long chats.
+#
+# Distinguished from persistent user profile (Phase 5):
+#   - Profile = static behavioural fingerprint (borrow history, taste vector)
+#   - Session memory = dynamic conversational context (what was said this chat)
+# ---------------------------------------------------------------------------
+
+def load_session(session_id: str, user_id: Optional[str] = None) -> dict:
+    """Get or create a conversation session document."""
+    now = datetime.now(timezone.utc)
+    session = conversations_collection.find_one({"session_id": session_id})
+    if not session:
+        session = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "created_at": now,
+            "last_active": now,
+            "turns": [],
+            "context_summary": None
+        }
+        conversations_collection.insert_one(session)
+    return session
+
+
+def save_turn(session_id: str, role: str, content: str, tool_call_id: Optional[str] = None):
+    """Append a single turn to the session's turns array and update last_active."""
+    turn = {
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now(timezone.utc)
+    }
+    if tool_call_id:
+        turn["tool_call_id"] = tool_call_id
+    conversations_collection.update_one(
+        {"session_id": session_id},
+        {
+            "$push": {"turns": turn},
+            "$set": {"last_active": datetime.now(timezone.utc)}
+        }
+    )
+
+
+def compress_context(session_id: str):
+    """
+    After every 10 turns, summarise the conversation and store as context_summary.
+    This keeps the token count manageable for long sessions.
+    Academic framing: token-budget-aware memory management.
+    """
+    session = conversations_collection.find_one({"session_id": session_id})
+    if not session or len(session.get("turns", [])) < 10:
+        return
+
+    turns_text = "\n".join(
+        f"{t['role'].upper()}: {t['content']}"
+        for t in session["turns"][-10:]
+        if t.get("content")
+    )
+
+    try:
+        summary_response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Summarise this BookSwap AI conversation in exactly 3 sentences. "
+                    "Include: what the student was looking for, what was recommended, "
+                    "and any preference or constraint they mentioned.\n\n"
+                    f"{turns_text}"
+                )
+            }],
+            temperature=0,
+            max_tokens=150
+        )
+        summary = summary_response.choices[0].message.content or ""
+        conversations_collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"context_summary": summary, "turns": []}}
+        )
+    except Exception:
+        pass  # compression is best-effort; don't crash the agent
+
+
+def get_session_messages(session_id: str, user_id: Optional[str] = None) -> list:
+    """
+    Build the messages list to inject into Groq.
+    Returns: list of {role, content} dicts representing the conversation history.
+
+    Priority:
+      1. If existing session has turns → return them as messages
+      2. If no turns but context_summary exists → inject as a brief system note
+      3. If new user, look for most recent past session → inject its summary
+      4. Otherwise → empty list (fresh start)
+    """
+    session = load_session(session_id, user_id)
+    turns = session.get("turns", [])
+
+    if turns:
+        # Convert stored turns to Groq message format
+        messages = []
+        for t in turns:
+            msg = {"role": t["role"], "content": t.get("content", "")}
+            if t.get("tool_call_id"):
+                msg["tool_call_id"] = t["tool_call_id"]
+            messages.append(msg)
+        return messages
+
+    # No turns in current session — check for summary from this session
+    if session.get("context_summary"):
+        return [{
+            "role": "system",
+            "content": f"[Conversation summary so far]: {session['context_summary']}"
+        }]
+
+    # New session — look for a past session summary for this user (persistent memory)
+    if user_id:
+        past = conversations_collection.find_one(
+            {
+                "user_id": user_id,
+                "session_id": {"$ne": session_id},
+                "context_summary": {"$ne": None}
+            },
+            sort=[("last_active", -1)]
+        )
+        if past and past.get("context_summary"):
+            return [{
+                "role": "system",
+                "content": (
+                    "[Note: This student has used BookSwap AI before. "
+                    f"Previous session summary]: {past['context_summary']}"
+                )
+            }]
+
+    return []
+
+
+# ---------------------------------------------------------------------------
 # REACT LOOP — extracted as a standalone function.
 #
 # Why extracted? The /evaluate endpoint (Phase 11) calls this function
@@ -603,20 +767,37 @@ def run_react_loop(
 
 @router.post("/agent", response_model=AgentResponse)
 def agent(request: AgentRequest):
-    # Assign or preserve session_id — frontend stores this in sessionStorage
-    # and sends it back on the next turn for conversation continuity (Phase 8)
+    # Assign or preserve session_id.
+    # New session: frontend generates a UUID and stores it in sessionStorage.
+    # Subsequent turns: frontend sends the same session_id back → history loaded.
     session_id = request.session_id or str(uuid.uuid4())
+    user_id = request.user_id  # None for unauthenticated / guests
 
-    # Build the initial messages list.
-    # System prompt is first — this is the "instruction layer" the LLM reads
-    # before the user's message. Extracted to SYSTEM_PROMPT constant above
-    # so Phase 5 (prompt upgrade) and Phase 11 (evaluation) can swap it easily.
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": request.message}
-    ]
+    # --- Build messages list ---
+    # Structure: system_prompt → [session history] → current user message
+    #
+    # session history: full turn array for current session, OR
+    #                  context_summary from past session (persistent memory)
+    # This gives the LLM awareness of what was said earlier in the conversation.
+    session_history = get_session_messages(session_id, user_id)
 
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(session_history)
+    messages.append({"role": "user", "content": request.message})
+
+    # Save user turn to session store
+    save_turn(session_id, "user", request.message)
+
+    # Run the ReAct loop
     response_text, tools_called, iterations = run_react_loop(messages, tools)
+
+    # Save assistant response to session store
+    save_turn(session_id, "assistant", response_text)
+
+    # Compress context if session is getting long (token budget management)
+    session = conversations_collection.find_one({"session_id": session_id})
+    if session and len(session.get("turns", [])) >= 10:
+        compress_context(session_id)
 
     return AgentResponse(
         response=response_text,
