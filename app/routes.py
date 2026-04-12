@@ -13,7 +13,7 @@ load_dotenv()
 router = APIRouter()
 
 client = MongoClient(os.environ.get("DB_URL"))
-db = client["test"]
+db = client[os.environ.get("DB_NAME", "books")]
 books_collection = db["books"]
 
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -193,7 +193,8 @@ def agent(request: AgentRequest):
                 model="llama-3.3-70b-versatile",
                 messages=messages,
                 tools=tools,
-                tool_choice="auto"
+                tool_choice="auto",
+                temperature=0  # reproducibility — evaluation results must be deterministic
             )
         except Exception as e:
             error_msg = str(e)

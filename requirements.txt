@@ -3,3 +3,7 @@ uvicorn
 sentence-transformers
 pymongo
 python-dotenv
+groq
+scikit-learn
+numpy
+pymupdf
