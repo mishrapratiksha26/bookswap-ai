@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 sentence-transformers
 pymongo
 python-dotenv
@@ -7,3 +7,5 @@ groq
 scikit-learn
 numpy
 pymupdf
+requests
+python-multipart

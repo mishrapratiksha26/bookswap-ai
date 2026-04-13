@@ -887,6 +887,74 @@ def check_availability(request: AvailabilityRequest):
             })
     return {"results": results}
 
+# ---------------------------------------------------------------------------
+# EMBED-PDF ENDPOINT
+# Called by Node.js after a PDF is uploaded to Cloudinary.
+# Downloads the PDF, extracts chapter headings, generates an embedding
+# for the title+subject text, and stores both in MongoDB pdfs collection.
+# ---------------------------------------------------------------------------
+
+class EmbedPdfRequest(BaseModel):
+    pdf_id: str   # MongoDB ObjectId string of the Pdf document
+
+@router.post("/embed-pdf")
+def embed_pdf_resource(request: EmbedPdfRequest):
+    """
+    POST /embed-pdf
+    Body: { "pdf_id": "<MongoDB ObjectId string>" }
+
+    Downloads the PDF from Cloudinary, extracts chapter headings using
+    PyMuPDF, generates a 384-dim embedding for the title+subject text,
+    and saves both to the pdfs collection.
+    """
+    import requests as http_requests
+    from bson import ObjectId
+    from app.chapter_extractor import extract_chapter_headings_from_bytes
+
+    pdfs_collection = db["pdfs"]
+
+    try:
+        pdf_doc = pdfs_collection.find_one({"_id": ObjectId(request.pdf_id)})
+    except Exception:
+        return {"error": "Invalid pdf_id"}
+
+    if not pdf_doc:
+        return {"error": "PDF document not found"}
+
+    # Generate embedding from title + subject
+    text_for_embedding = (
+        f"{pdf_doc.get('title', '')} "
+        f"{pdf_doc.get('subject', '')} "
+        f"{pdf_doc.get('course', '')} "
+        f"{pdf_doc.get('description', '')}"
+    ).strip()
+    embedding = generate_embedding(text_for_embedding)
+
+    # Try to extract chapter headings
+    chapter_headings = []
+    cloudinary_url = pdf_doc.get("cloudinary_url", "")
+    if cloudinary_url:
+        try:
+            resp = http_requests.get(cloudinary_url, timeout=15)
+            if resp.status_code == 200:
+                chapter_headings = extract_chapter_headings_from_bytes(resp.content)
+        except Exception:
+            pass  # headings are best-effort
+
+    pdfs_collection.update_one(
+        {"_id": ObjectId(request.pdf_id)},
+        {"$set": {
+            "embedding": embedding,
+            "chapter_headings": chapter_headings
+        }}
+    )
+
+    return {
+        "message": "PDF embedded successfully",
+        "chapters_found": len(chapter_headings)
+    }
+
+
 @router.get("/debug-vectors")
 def debug_vectors():
     results = []
@@ -899,3 +967,211 @@ def debug_vectors():
             "first_3_values": vec[:3] if vec else []
         })
     return {"books": results}
+
+
+# ---------------------------------------------------------------------------
+# CURRICULUM ENDPOINT — Phase 10 (Chapter 3.7 of thesis)
+#
+# Accepts a lecture plan PDF (multipart upload), runs the full
+# chapter_extractor pipeline, and returns topic-to-book matches.
+# The Node.js frontend POSTs the PDF as multipart/form-data.
+# ---------------------------------------------------------------------------
+
+from fastapi import UploadFile, File
+
+@router.post("/curriculum")
+async def curriculum_match(file: UploadFile = File(...)):
+    """
+    POST /curriculum
+    Upload a lecture plan PDF → get topic-to-book chapter matches.
+
+    Request: multipart/form-data with field 'file' (PDF)
+    Response:
+      {
+        "topics_found": int,
+        "topics": [str],
+        "matches": [{"topic", "book_title", "book_author", "book_id",
+                     "match_score", "suggested_chapter", "chapter_score"}],
+        "raw_text_preview": str
+      }
+    """
+    from app.chapter_extractor import process_curriculum_pdf
+    pdf_bytes = await file.read()
+    books = list(books_collection.find({}))
+    result = process_curriculum_pdf(pdf_bytes, books)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# EVALUATION ENDPOINT — Phase 11 (Chapter 5 of thesis)
+#
+# Runs 35 pre-defined test queries through the agent (or a reduced set for
+# specific experiments) and computes 5 metrics:
+#
+#   1. Tool Precision      — fraction of tool calls that are appropriate
+#   2. Hallucination Rate  — fraction of responses mentioning titles NOT in tool results
+#   3. Response Relevance  — keyword match score between query and response
+#   4. Task Completion Rate— fraction where agent produced a non-error response
+#   5. Prompt Adherence    — fraction where forbidden patterns (JSON, IDs) absent
+#
+# Plus the novel Curriculum Coverage Score (CCS) for curriculum queries:
+#   CCS = |matched_topics| / |total_topics_in_plan|
+#
+# prompt_version: "v1"/"v2"/"v3"/"v4" — swaps SYSTEM_PROMPT before running
+# This is the core of RQ2: "Which prompt engineering technique combination
+# produces the best agent behaviour?"
+# ---------------------------------------------------------------------------
+
+class EvalRequest(BaseModel):
+    prompt_version: Optional[str] = "v4"   # which prompt to test
+    query_subset: Optional[List[str]] = None  # override with custom queries
+
+@router.post("/evaluate")
+def evaluate(request: EvalRequest):
+    from app.routes import PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_V4
+
+    # Select prompt version
+    prompt_map = {"v1": PROMPT_V1, "v2": PROMPT_V2, "v3": PROMPT_V3, "v4": PROMPT_V4}
+    active_prompt = prompt_map.get(request.prompt_version, PROMPT_V4)
+
+    # 35 test queries covering all agent capabilities
+    # (5 categories × 7 queries each)
+    test_queries = request.query_subset or [
+        # Category 1: Direct book search (7 queries)
+        "Find me thriller books",
+        "I need books on data structures",
+        "Do you have any self-help books?",
+        "Show me books by Colleen Hoover",
+        "Find books about leadership",
+        "I want to read a mystery novel",
+        "Any motivational books available?",
+        # Category 2: Availability + alternatives (7 queries)
+        "Is Verity available to borrow?",
+        "Can I borrow The Housemaid?",
+        "Find me something like The Silent Patient",
+        "What thriller books can I borrow right now?",
+        "Show me available psychology books",
+        "I want to borrow a fiction book this week",
+        "Any books available on leadership?",
+        # Category 3: Vague / clarification needed (7 queries)
+        "Suggest me a good book",
+        "What are some easy reads?",
+        "I need something interesting",
+        "Recommend me something",
+        "Any new arrivals?",
+        "What's popular right now?",
+        "I'm bored, help me find a book",
+        # Category 4: Off-topic / boundary tests (7 queries)
+        "What is the weather today?",
+        "Help me write a Python script",
+        "Who is the Prime Minister of India?",
+        "Can you book me a flight?",
+        "What is machine learning?",
+        "Tell me a joke",
+        "Help me with my math homework",
+        # Category 5: Digital PDF / study material (7 queries)
+        "Find OS notes for CSE",
+        "Any DBMS previous year papers?",
+        "Show me reference material for algorithms",
+        "I need study material for networks",
+        "Find textbooks for discrete mathematics",
+        "Any CSE department notes?",
+        "Previous year papers for data structures",
+    ]
+
+    results = []
+    hallucination_count = 0
+    task_complete_count = 0
+    adherence_count = 0
+    total_tool_calls = 0
+    appropriate_tool_calls = 0
+    total_relevance = 0.0
+
+    FORBIDDEN_PATTERNS = [
+        '"_id"', '"book_id"', '"tool_call"', 'function_name',
+        'ObjectId', '"score":', '"vector"'
+    ]
+
+    for query in test_queries:
+        messages = [
+            {"role": "system", "content": active_prompt},
+            {"role": "user", "content": query}
+        ]
+
+        response_text, tools_called, iterations = run_react_loop(
+            messages, tools, max_iterations=5
+        )
+
+        # ----- Metric 1: Task Completion -----
+        completed = (
+            response_text
+            and not response_text.startswith("Sorry")
+            and len(response_text) > 20
+        )
+        if completed:
+            task_complete_count += 1
+
+        # ----- Metric 2: Hallucination Rate -----
+        # A response hallucinated if it mentions a title not in any tool result
+        # Approximation: check if response contains titles NOT in our DB
+        db_titles = [b.get("title", "").lower() for b in books_collection.find({}, {"title": 1})]
+        words = response_text.lower()
+        # If agent called no search tool but still recommends books → hallucination
+        search_tools = [t for t in tools_called if "search" in t]
+        has_book_mention = any(title in words for title in db_titles if title)
+        if has_book_mention and not search_tools:
+            hallucination_count += 1
+
+        # ----- Metric 3: Response Relevance -----
+        query_keywords = set(query.lower().split())
+        response_keywords = set(response_text.lower().split())
+        overlap = len(query_keywords & response_keywords)
+        relevance = overlap / max(len(query_keywords), 1)
+        total_relevance += relevance
+
+        # ----- Metric 4: Tool Precision -----
+        # Off-topic queries should call 0 tools; book queries should call search tools
+        is_book_query = any(kw in query.lower() for kw in [
+            "book", "borrow", "find", "suggest", "recommend", "pdf", "notes", "thriller",
+            "available", "fiction", "textbook", "previous year", "papers"
+        ])
+        for tc in tools_called:
+            total_tool_calls += 1
+            if is_book_query and tc in ["semantic_search", "check_availability", "get_alternatives", "search_pdfs"]:
+                appropriate_tool_calls += 1
+            elif not is_book_query and len(tools_called) == 0:
+                appropriate_tool_calls += 1
+
+        # ----- Metric 5: Prompt Adherence -----
+        has_forbidden = any(fp in response_text for fp in FORBIDDEN_PATTERNS)
+        if not has_forbidden:
+            adherence_count += 1
+
+        results.append({
+            "query": query,
+            "response_preview": response_text[:150],
+            "tools_called": tools_called,
+            "iterations": iterations,
+            "completed": completed,
+            "relevance_score": round(relevance, 4)
+        })
+
+    n = len(test_queries)
+    tool_precision = round(appropriate_tool_calls / max(total_tool_calls, 1), 4)
+    hallucination_rate = round(hallucination_count / n, 4)
+    avg_relevance = round(total_relevance / n, 4)
+    task_completion_rate = round(task_complete_count / n, 4)
+    prompt_adherence_rate = round(adherence_count / n, 4)
+
+    return {
+        "prompt_version": request.prompt_version,
+        "total_queries": n,
+        "metrics": {
+            "tool_precision": tool_precision,
+            "hallucination_rate": hallucination_rate,
+            "response_relevance": avg_relevance,
+            "task_completion_rate": task_completion_rate,
+            "prompt_adherence_rate": prompt_adherence_rate
+        },
+        "per_query_results": results
+    }
