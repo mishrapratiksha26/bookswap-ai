@@ -983,22 +983,49 @@ from fastapi import UploadFile, File
 async def curriculum_match(file: UploadFile = File(...)):
     """
     POST /curriculum
-    Upload a lecture plan PDF → get topic-to-book chapter matches.
+    Upload a lecture plan PDF → structured curriculum match.
 
-    Request: multipart/form-data with field 'file' (PDF)
     Response:
       {
-        "topics_found": int,
-        "topics": [str],
-        "matches": [{"topic", "book_title", "book_author", "book_id",
-                     "match_score", "suggested_chapter", "chapter_score"}],
-        "raw_text_preview": str
+        "course_name": str,
+        "course_code": str,
+        "department": str,
+        "recommended_books": [
+          {
+            "recommended_title": str,   <- what professor wrote
+            "found": bool,              <- is it in our library?
+            "book_title": str,
+            "book_author": str,
+            "book_id": str,
+            "available": bool,          <- available to borrow right now?
+            "match_score": float
+          }
+        ],
+        "unit_matches": [
+          {
+            "unit_no": int,
+            "unit_title": str,
+            "book_title": str,
+            "book_type": "physical",
+            "source": "professor_recommended" | "ai_suggested",
+            "available": bool,
+            "suggested_chapter": str,
+            "chapter_page": int | null,  <- page number if PDF TOC available
+            "match_score": float
+          }
+        ],
+        "error": str | null
       }
     """
     from app.chapter_extractor import process_curriculum_pdf
     pdf_bytes = await file.read()
+    # Pass physical books AND digital PDFs
+    # Physical books: borrowable copies in the books collection
+    # Digital PDFs: uploaded textbooks in the pdfs collection — these have
+    #               get_toc() page numbers from /embed-pdf, giving accurate chapters
     books = list(books_collection.find({}))
-    result = process_curriculum_pdf(pdf_bytes, books)
+    pdfs  = list(db["pdfs"].find({}))
+    result = process_curriculum_pdf(pdf_bytes, books, pdfs)
     return result
 
 
