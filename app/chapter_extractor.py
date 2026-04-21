@@ -30,6 +30,8 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from groq import Groq
 from app.embeddings import generate_embedding
+from app.prompts import get_curriculum_prompt, CURRICULUM_LATEST
+from app.experiment_log import log_curriculum_run
 
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
@@ -80,68 +82,48 @@ def extract_text_from_bytes(pdf_bytes: bytes) -> str:
 # STEP 2 — Parse topics from extracted text using Groq
 # ---------------------------------------------------------------------------
 
-LECTURE_PLAN_PARSE_PROMPT = """You are parsing an IIT ISM Dhanbad standard lecture plan PDF.
-These PDFs always follow the same 2-page format:
-  Page 1: Course details + a table of units with topics
-  Page 2: Textbooks and Reference Books listed by the professor
-
-Extract ALL of the following and return ONLY valid JSON. No explanation, no markdown.
-
-Return this exact structure:
-{
-  "course_name": "string — name of the course",
-  "course_code": "string — e.g. MCO502",
-  "department": "string — department name",
-  "units": [
-    {
-      "unit_no": 1,
-      "title": "short unit title e.g. Network Analysis",
-      "topics": ["topic 1", "topic 2"]
-    }
-  ],
-  "textbooks": ["Author: Title, Publisher, Year", ...],
-  "reference_books": ["Author: Title, Publisher, Year", ...]
-}
-
-Lecture plan text:
-{text}"""
-
-
-def parse_lecture_plan(text: str) -> dict:
+def parse_lecture_plan(text: str, prompt_version: str | None = None) -> dict:
     """
     Parse a complete IIT ISM lecture plan PDF text into structured data.
 
-    Returns a dict with:
-      course_name, course_code, department,
-      units: [{unit_no, title, topics[]}],
-      textbooks: [str],
-      reference_books: [str]
+    Args:
+      text            raw text extracted from the lecture-plan PDF
+      prompt_version  which curriculum prompt template to use ("v1", "v2", ...)
+                      defaults to the latest version in app/prompts/__init__.py
+
+    Returns:
+      dict with course_name, course_code, department, units[], textbooks[],
+      reference_books[]. Empty dict on failure (error is printed to stderr).
 
     Why one Groq call instead of two?
       The old approach made one call for topics only — ignoring the book list
       on page 2 entirely. The professor's recommended books are ground truth.
-      We should check those first before doing any semantic search.
-      One structured call extracts everything we need in one shot.
+      We should check those first before doing any semantic search. One
+      structured call extracts everything in one shot.
+
+    Why prompt_version is a first-class argument (thesis Chapter 5):
+      The curriculum-parser prompt evolves (v1 → v2 → ...). To produce the
+      ablation table in the results chapter we need to run the SAME PDF through
+      different prompt versions without patching the source. Pass the version
+      in; get back whatever that version's prompt produces.
     """
     if not text or len(text.strip()) < 50:
         return {}
 
     try:
+        prompt_template = get_curriculum_prompt(prompt_version)
         # NOTE: use .replace(), NOT .format(). The prompt contains literal
         # JSON curly braces as an example of the desired output shape, and
         # str.format() would interpret every "{" as a format placeholder
         # and raise ValueError. That error was silently caught below, which
         # is why the route kept returning "Could not parse lecture plan"
         # even for perfectly text-based PDFs.
-        filled_prompt = LECTURE_PLAN_PARSE_PROMPT.replace("{text}", text[:4000])
+        filled_prompt = prompt_template.replace("{text}", text[:4000])
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{
-                "role": "user",
-                "content": filled_prompt
-            }],
+            messages=[{"role": "user", "content": filled_prompt}],
             temperature=0,
-            max_tokens=1000
+            max_tokens=1000,
         )
         raw = response.choices[0].message.content or "{}"
         raw = raw.strip()
@@ -274,13 +256,54 @@ def find_best_chapter(topic_vec: np.ndarray, book: dict) -> dict:
 
 PROFESSOR_BOOK_MATCH_THRESHOLD = 0.60   # cosine sim threshold for "found in library"
 
+def _normalise_recommended_entry(entry) -> dict:
+    """
+    Groq may return a structured dict {title, authors} (new format) OR a plain
+    string (old format, or if the LLM ignored instructions). Normalise both to
+    {title, authors} so the rest of the pipeline has one shape to deal with.
+
+    String fallback heuristic: the longest comma-separated chunk that doesn't
+    look like a publisher/year is probably the title; the rest we treat as
+    authors. This is only a safety net — the prompt should usually return dicts.
+    """
+    if isinstance(entry, dict):
+        return {
+            "title":   (entry.get("title") or "").strip(),
+            "authors": (entry.get("authors") or "").strip(),
+        }
+
+    # Legacy string handling — best-effort split
+    s = str(entry or "").strip()
+    if not s:
+        return {"title": "", "authors": ""}
+
+    # common publishers/editions we want to strip
+    noise = ("wiley", "pearson", "springer", "mcgraw", "phi", "oxford",
+             "sultan chand", "prentice", "cengage", "tmh", "edition", "ed.")
+    parts = [p.strip() for p in s.replace(":", ",").split(",") if p.strip()]
+    parts = [p for p in parts
+             if not p.isdigit()
+             and not any(n in p.lower() for n in noise)]
+
+    if not parts:
+        return {"title": s, "authors": ""}
+    # assume longest chunk is the title
+    title = max(parts, key=len)
+    authors = ", ".join(p for p in parts if p != title)
+    return {"title": title, "authors": authors}
+
+
 def find_recommended_books_in_inventory(
-    recommended: list[str],
+    recommended: list,
     books: list[dict]
 ) -> list[dict]:
     """
-    For each professor-recommended book string (from lecture plan page 2),
-    search the inventory using vector similarity on title+author text.
+    For each professor-recommended book (from lecture plan page 2), search the
+    inventory using vector similarity on title+author text.
+
+    `recommended` accepts two shapes:
+      - New (preferred): [{"title": "...", "authors": "..."}, ...]
+      - Legacy: ["Author: Title, Publisher, Year", ...]  — auto-normalised.
 
     Why vectors and not exact string match?
       The professor writes: "Kanti Swarup, P.K. Gupta: Operations Research, Sultan Chand, 2017"
@@ -289,7 +312,8 @@ def find_recommended_books_in_inventory(
 
     Returns list of:
       {
-        "recommended_title": str,   # what the professor wrote
+        "recommended_title": str,   # clean title extracted from plan (for display)
+        "recommended_authors": str, # authors extracted from plan (for display)
         "found": bool,
         "book_title": str,          # what's in our DB (if found)
         "book_author": str,
@@ -301,8 +325,17 @@ def find_recommended_books_in_inventory(
     books_with_vectors = [b for b in books if b.get("vector")]
     results = []
 
-    for rec_title in recommended:
-        rec_vec = np.array([generate_embedding(rec_title)])
+    for entry in recommended:
+        rec = _normalise_recommended_entry(entry)
+        rec_title   = rec["title"]
+        rec_authors = rec["authors"]
+        if not rec_title:
+            continue
+
+        # Embed title + authors together — gives a cleaner signal than the
+        # raw citation string (which had publishers, years, edition numbers).
+        embed_text = f"{rec_title} {rec_authors}".strip()
+        rec_vec = np.array([generate_embedding(embed_text)])
 
         best_score = 0.0
         best_book  = None
@@ -315,7 +348,8 @@ def find_recommended_books_in_inventory(
 
         if best_book and best_score >= PROFESSOR_BOOK_MATCH_THRESHOLD:
             results.append({
-                "recommended_title": rec_title,
+                "recommended_title":   rec_title,
+                "recommended_authors": rec_authors,
                 "found":       True,
                 "book_title":  best_book.get("title", ""),
                 "book_author": best_book.get("author", ""),
@@ -325,7 +359,8 @@ def find_recommended_books_in_inventory(
             })
         else:
             results.append({
-                "recommended_title": rec_title,
+                "recommended_title":   rec_title,
+                "recommended_authors": rec_authors,
                 "found":       False,
                 "book_title":  "",
                 "book_author": "",
@@ -639,36 +674,73 @@ def map_units_to_chapters(
 # STEP 7 — Full pipeline entry point
 # ---------------------------------------------------------------------------
 
-def process_curriculum_pdf(pdf_bytes: bytes, books: list[dict], pdfs: list[dict] = None) -> dict:
+def process_curriculum_pdf(
+    pdf_bytes: bytes,
+    books: list[dict],
+    pdfs: list[dict] = None,
+    *,
+    prompt_version: str | None = None,
+    pdf_filename: str | None = None,
+) -> dict:
     """
     Full pipeline: lecture plan PDF bytes → structured curriculum match.
 
+    Args:
+      pdf_bytes       raw PDF bytes (as received from the upload form)
+      books           current physical-book inventory (list of Book docs)
+      pdfs            current digital-PDF inventory (list of Pdf docs)
+      prompt_version  which curriculum prompt to use ("v1", "v2"); defaults
+                      to latest from app/prompts/__init__.py
+      pdf_filename    original upload filename — logged for reproducibility
+
+    Every call (success or failure) appends one row to
+    experiments/curriculum_runs.jsonl so Chapter 5 tables can be built by
+    reading that log without re-running the pipeline.
+
     Returns:
       {
-        "course_name": str,
-        "course_code": str,
-        "department": str,
-        "recommended_books": [   ← professor's books, found/not found in library
-          {"recommended_title", "found", "book_title", "available", "match_score", ...}
-        ],
-        "unit_matches": [        ← each unit → best book + chapter + page
-          {"unit_no", "unit_title", "book_title", "source", "suggested_chapter",
-           "chapter_page", "available", "match_score", ...}
-        ],
-        "error": str | None
+        "course_name", "course_code", "department",
+        "recommended_books": [...],
+        "unit_matches":      [...],
+        "prompt_version":    str,   ← echoed back so the caller can log
+        "error":             str | None
       }
     """
+    active_version = prompt_version or CURRICULUM_LATEST
+
     # Extract raw text from PDF
     raw_text = extract_text_from_bytes(pdf_bytes)
     if raw_text.startswith("ERROR:"):
-        return {"error": raw_text}
+        # Still log the failed attempt — useful to know which PDFs are scanned/broken.
+        log_curriculum_run(
+            prompt_version=active_version,
+            pdf_filename=pdf_filename,
+            raw_text_len=0,
+            parsed={},
+            recommended_books=[],
+            unit_matches=[],
+            error=raw_text,
+        )
+        return {"error": raw_text, "prompt_version": active_version}
 
     # One Groq call to parse everything: units + textbooks + reference books
-    parsed = parse_lecture_plan(raw_text)
+    parsed = parse_lecture_plan(raw_text, prompt_version=active_version)
     if not parsed:
-        return {"error": "Could not parse lecture plan. Is it a text-based PDF?"}
+        log_curriculum_run(
+            prompt_version=active_version,
+            pdf_filename=pdf_filename,
+            raw_text_len=len(raw_text),
+            parsed={},
+            recommended_books=[],
+            unit_matches=[],
+            error="Could not parse lecture plan (LLM returned empty/invalid JSON)",
+        )
+        return {
+            "error": "Could not parse lecture plan. Is it a text-based PDF?",
+            "prompt_version": active_version,
+        }
 
-    units    = parsed.get("units", [])
+    units     = parsed.get("units", [])
     textbooks = parsed.get("textbooks", []) + parsed.get("reference_books", [])
 
     # Step A: find professor's recommended books in our inventory
@@ -680,11 +752,24 @@ def process_curriculum_pdf(pdf_bytes: bytes, books: list[dict], pdfs: list[dict]
     # Step B: map each unit to best chapter (professor books first, fallback second)
     unit_matches = map_units_to_chapters(units, books, preferred_book_ids=found_ids, pdfs=pdfs)
 
+    # Append run record for thesis Chapter 5 — happens AFTER all matching so we
+    # capture the full end-to-end outcome, not just what the LLM parsed.
+    log_curriculum_run(
+        prompt_version=active_version,
+        pdf_filename=pdf_filename,
+        raw_text_len=len(raw_text),
+        parsed=parsed,
+        recommended_books=recommended_books,
+        unit_matches=unit_matches,
+        error=None,
+    )
+
     return {
         "course_name":       parsed.get("course_name", ""),
         "course_code":       parsed.get("course_code", ""),
         "department":        parsed.get("department", ""),
         "recommended_books": recommended_books,
         "unit_matches":      unit_matches,
-        "error":             None
+        "prompt_version":    active_version,
+        "error":             None,
     }

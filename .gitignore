@@ -1,2 +1,14 @@
 .env
 bash.exe.stackdump.env
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local uvicorn log artefact from testing
+server_test.log
+
+# Experiment run logs — append-only, grow unbounded, not source.
+# Commit *frozen* snapshots into experiments/snapshots/ instead.
+experiments/*.jsonl
+!experiments/snapshots/**

@@ -35,119 +35,27 @@ except Exception:
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # ---------------------------------------------------------------------------
-# SYSTEM PROMPTS — four swappable versions for RQ2 evaluation experiment.
+# SYSTEM PROMPTS — now sourced from app/prompts/{agent_v1..v4}.py.
 #
-# v1: Minimal baseline — no guidance at all.
-# v2: Role + Rules — adds identity and hard constraints.
-# v3: v2 + Few-shot + Negative examples — shows correct/incorrect behaviour.
-# v4: Full hybrid — CoT + sandwich structure (Lost in Middle fix). PRODUCTION.
+# The four agent prompt versions for thesis RQ2 live in the registry at
+# app/prompts/__init__.py. The constants below are thin aliases kept ONLY
+# for backward compatibility with anything that still imports them by name
+# from this module.
 #
-# To run evaluation: swap SYSTEM_PROMPT = PROMPT_V1 / V2 / V3 / V4 and
-# hit POST /evaluate. The loop + tools stay identical — only prompt changes.
-# This isolates prompt technique contribution for Chapter 5, Table 1.
+# Production path (GET /agent): reads the version from the request and calls
+# get_agent_prompt(version) — not these constants.
+# Evaluation path (POST /evaluate): same, via prompt_map below.
 # ---------------------------------------------------------------------------
 
-# v1 — intentionally minimal; establishes the performance floor
-PROMPT_V1 = "You are a helpful assistant. Help users find books."
+from app.prompts import AGENT_PROMPTS, AGENT_LATEST  # noqa: E402
 
-# v2 — role + mandatory rules (no examples, no reasoning scaffold)
-PROMPT_V2 = """You are BookSwap Scholar — an expert AI librarian for IIT (ISM) Dhanbad's
-peer-to-peer book-sharing platform. You help students find books they can actually borrow.
+PROMPT_V1 = AGENT_PROMPTS["v1"]
+PROMPT_V2 = AGENT_PROMPTS["v2"]
+PROMPT_V3 = AGENT_PROMPTS["v3"]
+PROMPT_V4 = AGENT_PROMPTS["v4"]
 
-MANDATORY RULES:
-R1. NEVER recommend a book not returned by a semantic_search tool call.
-R2. ALWAYS call semantic_search before mentioning any book title.
-R3. ALWAYS call check_availability for every book_id that semantic_search returns.
-R4. If a book is unavailable, call get_alternatives immediately.
-R5. NEVER show JSON, tool names, book IDs, or function calls to the user.
-R6. For vague queries ("good books", "something interesting"), ask ONE clarifying
-    question about genre/subject BEFORE searching.
-R7. Only recommend books that match the user's actual request — filter irrelevant
-    results using context (e.g. do not show textbooks to someone wanting light fiction)."""
-
-# v3 — v2 + few-shot positive example + negative example (anti-hallucination)
-PROMPT_V3 = PROMPT_V2 + """
-
-EXAMPLE OF CORRECT BEHAVIOUR:
-User: "Find me thriller books"
-Step 1 — call semantic_search("thriller books")
-Step 2 — call check_availability([all returned book_ids])
-Step 3 — respond:
-  "Here are some thrillers available to borrow:
-   📗 Verity by Colleen Hoover ✅ Available now — a dark psychological thriller about
-   a ghostwriter who uncovers a chilling secret about her host's past.
-   📗 The Silent Patient ❌ Unavailable — expected back by March 21, 2026.
-   Want me to find an alternative for The Silent Patient? 😊"
-
-EXAMPLE OF FORBIDDEN BEHAVIOUR (never do this):
-User: "Anything like Housemaid?"
-get_alternatives returns empty.
-WRONG: "You might enjoy Behind Closed Doors by B.A. Paris ✅ Available"
-WHY WRONG: That title was not in any tool result — it is hallucinated.
-This destroys student trust. A made-up book wastes their time.
-CORRECT: "No similar books available right now — check back in a few days! 😊
-          In the meantime, want me to search a different thriller for you?"
-
-WRONG: "book_id: 69b1a90794dfe474eda10506" or "{\"title\": \"Verity\"}"
-WHY WRONG: Internal IDs and JSON must never appear in responses."""
-
-# v4 — full hybrid: v3 + chain-of-thought + sandwich structure (PRODUCTION)
-# Sandwich fix (Liu et al. 2023 — Lost in the Middle):
-# Most critical constraint appears at TOP and is REPEATED at BOTTOM.
-# Supporting content (reasoning protocol, examples, tone) lives in the MIDDLE.
-PROMPT_V4 = """You are BookSwap Scholar — an expert AI librarian for IIT (ISM) Dhanbad's
-peer-to-peer book-sharing platform. You speak like a knowledgeable, warm friend.
-
-CRITICAL — READ THIS FIRST:
-NEVER mention any book title that was not returned by a tool call.
-This is the single most important rule. Violating it destroys student trust.
-
-MANDATORY RULES:
-R1. NEVER recommend a book not returned by semantic_search.
-R2. ALWAYS call semantic_search before mentioning any book.
-R3. ALWAYS call check_availability for every book_id returned.
-R4. If a book is unavailable, call get_alternatives immediately.
-R5. NEVER show JSON, tool names, book IDs, or internal data to the user.
-R6. For vague queries, ask ONE clarifying question before searching.
-R7. Filter results by context — do NOT show textbooks to someone wanting light fiction.
-R8. For unavailable books, show the returnDate if available: "Expected back by [date]".
-
-REASONING PROTOCOL — think through these steps before every response:
-Step 1: Classify the query (specific title / genre / vague / off-topic).
-Step 2: If off-topic (not about books/borrowing), politely decline and redirect.
-Step 3: If vague (no genre/subject), ask ONE clarifying question — do not search yet.
-Step 4: Call semantic_search with the best extracted search terms.
-Step 5: Call check_availability for ALL book_ids from the search result.
-Step 6: For every unavailable book that is a strong match, call get_alternatives.
-Step 7: Filter results — remove any book that clearly mismatches the user's request.
-Step 8: Format the response: title + author + 1-sentence description + availability icon.
-Step 9: End with a warm follow-up question.
-Step 10: Verify — does your response mention ANY title not in a tool result? If yes, remove it.
-
-EXAMPLE — CORRECT (few-shot):
-User: "Find me thriller books"
-[call semantic_search("thriller books")]
-[call check_availability([ids])]
-Response:
-"Here are thrillers available to borrow:
- 📗 Verity by Colleen Hoover ✅ Available — dark psychological thriller, incredibly gripping.
- 📗 The Housemaid by Freida McFadden ❌ Unavailable — expected back by March 27, 2026.
- Want me to find something similar to The Housemaid? 😊"
-
-EXAMPLE — FORBIDDEN (anti-hallucination):
-get_alternatives returns empty for a book.
-WRONG: "You might also enjoy Gone Girl by Gillian Flynn ✅" ← NOT in tool result.
-CORRECT: "No alternatives available right now — check back soon! 😊"
-
-TONE: Warm and friendly like a helpful librarian 📚. Short paragraphs. No bullet overload.
-Use 📗 for physical books. ✅ for available. ❌ for unavailable.
-
-FINAL REMINDER — READ THIS LAST:
-Every single book title you write MUST appear in a tool result.
-Honesty over helpfulness — always. If you cannot find a match, say so clearly."""
-
-# Active prompt — swap this for evaluation experiments
-SYSTEM_PROMPT = PROMPT_V4
+# Legacy default — latest production prompt. Prefer get_agent_prompt() in new code.
+SYSTEM_PROMPT = AGENT_PROMPTS[AGENT_LATEST]
 
 # ---------------------------------------------------------------------------
 # PYDANTIC MODELS
@@ -179,6 +87,11 @@ class AgentRequest(BaseModel):
     message: str
     user_id: Optional[str] = None      # MongoDB ObjectId string — who is asking
     session_id: Optional[str] = None   # UUID — which conversation this belongs to
+    # Thesis RQ2: allow the Node.js layer (or an evaluation harness) to pin
+    # a specific agent prompt version per-request — "v1".."v4". Unset means
+    # "use the latest" (AGENT_LATEST in app/prompts/__init__.py). Every run
+    # is logged to experiments/agent_runs.jsonl alongside the version used.
+    prompt_version: Optional[str] = None
 
 class AgentResponse(BaseModel):
     response: str
@@ -838,6 +751,20 @@ def agent(request: AgentRequest):
     session_id = request.session_id or str(uuid.uuid4())
     user_id = request.user_id  # None for unauthenticated / guests
 
+    # Pick the agent system prompt by version. None → latest (AGENT_LATEST).
+    # The request path uses the registry instead of the legacy SYSTEM_PROMPT
+    # constant so evaluation runs can swap versions without touching code.
+    from app.prompts import get_agent_prompt, AGENT_LATEST
+    from app.experiment_log import log_agent_run
+
+    active_version = request.prompt_version or AGENT_LATEST
+    try:
+        active_prompt = get_agent_prompt(active_version)
+    except ValueError:
+        # Unknown version → fall back to latest, but log the anomaly
+        active_version = AGENT_LATEST
+        active_prompt  = get_agent_prompt(active_version)
+
     # --- Build messages list ---
     # Structure: system_prompt → [session history] → current user message
     #
@@ -846,7 +773,7 @@ def agent(request: AgentRequest):
     # This gives the LLM awareness of what was said earlier in the conversation.
     session_history = get_session_messages(session_id, user_id)
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": active_prompt}]
     messages.extend(session_history)
     messages.append({"role": "user", "content": request.message})
 
@@ -854,7 +781,14 @@ def agent(request: AgentRequest):
     save_turn(session_id, "user", request.message)
 
     # Run the ReAct loop
-    response_text, tools_called, iterations = run_react_loop(messages, tools)
+    loop_error = None
+    try:
+        response_text, tools_called, iterations = run_react_loop(messages, tools)
+    except Exception as e:
+        loop_error = str(e)
+        response_text, tools_called, iterations = (
+            "Sorry, something went wrong. Please try again.", [], 0
+        )
 
     # Save assistant response to session store
     save_turn(session_id, "assistant", response_text)
@@ -863,6 +797,20 @@ def agent(request: AgentRequest):
     session = conversations_collection.find_one({"session_id": session_id})
     if session and len(session.get("turns", [])) >= 10:
         compress_context(session_id)
+
+    # Thesis Chapter 5: append one row per response to agent_runs.jsonl —
+    # lets us compute Tool Precision, Hallucination Rate, etc. offline by
+    # reading the log instead of re-running the agent.
+    log_agent_run(
+        prompt_version=active_version,
+        user_id=user_id,
+        session_id=session_id,
+        query=request.message,
+        response=response_text,
+        tools_called=tools_called,
+        iterations=iterations,
+        error=loop_error,
+    )
 
     return AgentResponse(
         response=response_text,
@@ -1042,10 +990,13 @@ def debug_vectors():
 # The Node.js frontend POSTs the PDF as multipart/form-data.
 # ---------------------------------------------------------------------------
 
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Form
 
 @router.post("/curriculum")
-async def curriculum_match(file: UploadFile = File(...)):
+async def curriculum_match(
+    file: UploadFile = File(...),
+    prompt_version: Optional[str] = Form(None),
+):
     """
     POST /curriculum
     Upload a lecture plan PDF → structured curriculum match.
@@ -1090,7 +1041,13 @@ async def curriculum_match(file: UploadFile = File(...)):
     #               get_toc() page numbers from /embed-pdf, giving accurate chapters
     books = list(books_collection.find({}))
     pdfs  = list(db["pdfs"].find({}))
-    result = process_curriculum_pdf(pdf_bytes, books, pdfs)
+    result = process_curriculum_pdf(
+        pdf_bytes,
+        books,
+        pdfs,
+        prompt_version=prompt_version,   # None → falls back to latest
+        pdf_filename=file.filename,      # logged for thesis reproducibility
+    )
     return result
 
 
@@ -1120,11 +1077,16 @@ class EvalRequest(BaseModel):
 
 @router.post("/evaluate")
 def evaluate(request: EvalRequest):
-    from app.routes import PROMPT_V1, PROMPT_V2, PROMPT_V3, PROMPT_V4
+    from app.prompts import get_agent_prompt, AGENT_LATEST
+    from app.experiment_log import log_agent_run
 
-    # Select prompt version
-    prompt_map = {"v1": PROMPT_V1, "v2": PROMPT_V2, "v3": PROMPT_V3, "v4": PROMPT_V4}
-    active_prompt = prompt_map.get(request.prompt_version, PROMPT_V4)
+    # Select prompt version from the registry — same source of truth as /agent.
+    active_version = request.prompt_version or AGENT_LATEST
+    try:
+        active_prompt = get_agent_prompt(active_version)
+    except ValueError:
+        active_version = AGENT_LATEST
+        active_prompt  = get_agent_prompt(active_version)
 
     # 35 test queries covering all agent capabilities
     # (5 categories × 7 queries each)
@@ -1194,6 +1156,20 @@ def evaluate(request: EvalRequest):
             messages, tools, max_iterations=5
         )
 
+        # Log this individual query run so the Chapter 5 ablation table can be
+        # built by reading experiments/agent_runs.jsonl, filtered on
+        # prompt_version. Each /evaluate invocation produces 35 rows here.
+        log_agent_run(
+            prompt_version=active_version,
+            user_id=None,
+            session_id=f"eval-{active_version}",
+            query=query,
+            response=response_text,
+            tools_called=tools_called,
+            iterations=iterations,
+            error=None,
+        )
+
         # ----- Metric 1: Task Completion -----
         completed = (
             response_text
@@ -1256,7 +1232,7 @@ def evaluate(request: EvalRequest):
     prompt_adherence_rate = round(adherence_count / n, 4)
 
     return {
-        "prompt_version": request.prompt_version,
+        "prompt_version": active_version,
         "total_queries": n,
         "metrics": {
             "tool_precision": tool_precision,
