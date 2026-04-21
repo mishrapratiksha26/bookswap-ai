@@ -295,34 +295,46 @@ def _normalise_recommended_entry(entry) -> dict:
 
 def find_recommended_books_in_inventory(
     recommended: list,
-    books: list[dict]
+    books: list[dict],
+    pdfs: list[dict] | None = None,
 ) -> list[dict]:
     """
-    For each professor-recommended book (from lecture plan page 2), search the
-    inventory using vector similarity on title+author text.
+    For each professor-recommended book (from lecture plan page 2), search BOTH
+    the physical-book inventory AND the digital-PDF inventory using vector
+    similarity on title+author text. Best match across both wins.
+
+    Why search both:
+      The professor writes "Operating Systems Principles — Silberschatz, Galvin".
+      A student may have uploaded the PDF as "Operating System Concepts — Galvin".
+      Those are the same textbook. If we only searched `books`, the student's
+      uploaded PDF would never count as "professor's book found" — even though
+      it has the exact chapter structure we need for the Unit → Chapter map.
 
     `recommended` accepts two shapes:
       - New (preferred): [{"title": "...", "authors": "..."}, ...]
       - Legacy: ["Author: Title, Publisher, Year", ...]  — auto-normalised.
 
-    Why vectors and not exact string match?
-      The professor writes: "Kanti Swarup, P.K. Gupta: Operations Research, Sultan Chand, 2017"
-      The student posted it as: "Operations Research"
-      Exact match fails. Vector similarity finds it.
-
     Returns list of:
       {
-        "recommended_title": str,   # clean title extracted from plan (for display)
-        "recommended_authors": str, # authors extracted from plan (for display)
-        "found": bool,
-        "book_title": str,          # what's in our DB (if found)
-        "book_author": str,
-        "book_id": str,
-        "available": bool,
-        "match_score": float
+        "recommended_title":   str,   # clean title extracted from plan (for display)
+        "recommended_authors": str,
+        "found":           bool,
+        "source_type":     "physical" | "pdf" | "",    # which collection matched
+        "book_title":      str,       # from matched document
+        "book_author":     str,
+        "book_id":         str,       # physical book ObjectId OR pdf ObjectId
+        "cloudinary_url":  str,       # only set when source_type == "pdf"
+        "available":       bool,      # physical: live; pdf: always True (downloadable)
+        "match_score":     float
       }
+
+    Note: `book_id` holds the ID regardless of source_type — downstream
+    map_units_to_chapters already splits the flat `preferred_book_ids` list
+    into books vs pdfs by checking each collection, so a PDF id flows through
+    naturally.
     """
     books_with_vectors = [b for b in books if b.get("vector")]
+    pdfs_with_vectors  = [p for p in (pdfs or []) if p.get("embedding")]
     results = []
 
     for entry in recommended:
@@ -332,41 +344,68 @@ def find_recommended_books_in_inventory(
         if not rec_title:
             continue
 
-        # Embed title + authors together — gives a cleaner signal than the
-        # raw citation string (which had publishers, years, edition numbers).
+        # Embed title + authors together — cleaner signal than raw citation
+        # (which had publishers, years, edition numbers as noise).
         embed_text = f"{rec_title} {rec_authors}".strip()
         rec_vec = np.array([generate_embedding(embed_text)])
 
-        best_score = 0.0
-        best_book  = None
+        best_score  = 0.0
+        best_item   = None
+        best_type   = ""   # "physical" | "pdf"
+
+        # --- Search physical books ---
         for book in books_with_vectors:
             book_vec = np.array([book["vector"]])
             score    = float(cosine_similarity(rec_vec, book_vec)[0][0])
             if score > best_score:
                 best_score = score
-                best_book  = book
+                best_item  = book
+                best_type  = "physical"
 
-        if best_book and best_score >= PROFESSOR_BOOK_MATCH_THRESHOLD:
+        # --- Search digital PDFs (student-uploaded soft copies) ---
+        for pdf in pdfs_with_vectors:
+            pdf_vec = np.array([pdf["embedding"]])
+            score   = float(cosine_similarity(rec_vec, pdf_vec)[0][0])
+            if score > best_score:
+                best_score = score
+                best_item  = pdf
+                best_type  = "pdf"
+
+        if best_item and best_score >= PROFESSOR_BOOK_MATCH_THRESHOLD:
+            # PDFs don't have an `author` field — fall back to `professor` (uploader)
+            # or leave blank. The professor-recommended authors still show via
+            # `recommended_authors` in the card subtitle.
+            item_author = (
+                best_item.get("author", "") if best_type == "physical"
+                else best_item.get("professor", "")
+            )
             results.append({
                 "recommended_title":   rec_title,
                 "recommended_authors": rec_authors,
-                "found":       True,
-                "book_title":  best_book.get("title", ""),
-                "book_author": best_book.get("author", ""),
-                "book_id":     str(best_book.get("_id", "")),
-                "available":   best_book.get("available", True),
-                "match_score": round(best_score, 4)
+                "found":           True,
+                "source_type":     best_type,
+                "book_title":      best_item.get("title", ""),
+                "book_author":     item_author,
+                "book_id":         str(best_item.get("_id", "")),
+                "cloudinary_url":  best_item.get("cloudinary_url", "") if best_type == "pdf" else "",
+                "available":       (
+                    best_item.get("available", True) if best_type == "physical"
+                    else True   # PDFs are always downloadable
+                ),
+                "match_score":     round(best_score, 4)
             })
         else:
             results.append({
                 "recommended_title":   rec_title,
                 "recommended_authors": rec_authors,
-                "found":       False,
-                "book_title":  "",
-                "book_author": "",
-                "book_id":     "",
-                "available":   False,
-                "match_score": round(best_score, 4) if best_book else 0.0
+                "found":           False,
+                "source_type":     "",
+                "book_title":      "",
+                "book_author":     "",
+                "book_id":         "",
+                "cloudinary_url":  "",
+                "available":       False,
+                "match_score":     round(best_score, 4) if best_item else 0.0
             })
 
     return results
@@ -835,8 +874,10 @@ def process_curriculum_pdf(
     units     = parsed.get("units", [])
     textbooks = parsed.get("textbooks", []) + parsed.get("reference_books", [])
 
-    # Step A: find professor's recommended books in our inventory
-    recommended_books = find_recommended_books_in_inventory(textbooks, books)
+    # Step A: find professor's recommended books in our inventory.
+    # Search BOTH physical and PDF collections — a student-uploaded PDF of
+    # Silberschatz counts as "the professor's book is in our library".
+    recommended_books = find_recommended_books_in_inventory(textbooks, books, pdfs)
 
     # IDs of recommended books that were actually found in library
     found_ids = [r["book_id"] for r in recommended_books if r["found"]]
