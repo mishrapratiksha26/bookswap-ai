@@ -735,17 +735,23 @@ def map_units_to_chapters(
 def find_course_related_notes(
     course_name: str,
     course_code: str,
-    department: str,
+    department: str,     # kept in signature for future use; deliberately unused today
     pdfs: list[dict] | None,
     limit_per_type: int = 3,
 ) -> list[dict]:
     """
-    Find PDFs tagged to the lecture plan's course or department.
+    Find PDFs tagged to the *exact course* of the lecture plan.
 
-    Match on any of (case-insensitive substring):
-      - pdf.course        ⊇ course_code  or  course_name
-      - pdf.subject       ⊇ course_name
-      - pdf.department    ⊇ department
+    Match only on course — not department:
+      - pdf.course        ⊇ course_code   (strongest, e.g. "MCC510")
+      - pdf.course        ⊇ course_name   (e.g. "Operating Systems")
+      - pdf.subject       ⊇ course_name   (subject line mentions the course)
+
+    Why NOT department: a single department (e.g. "Computer Science and
+    Engineering") hosts 50+ courses. Falling back to department would show
+    DBMS, AI, and ML resources on an OS lecture plan — technically in the
+    same department, but useless for this course. Students tag uploads with
+    a specific course; honour that.
 
     Returns flat list (grouped/capped per resource_type) — UI groups for display.
     """
@@ -754,29 +760,25 @@ def find_course_related_notes(
 
     course_name_lc = (course_name or "").strip().lower()
     course_code_lc = (course_code or "").strip().lower()
-    department_lc  = (department or "").strip().lower()
 
-    # Nothing to match against → nothing to return
-    if not (course_name_lc or course_code_lc or department_lc):
+    # No course signal → return nothing. Department alone is too noisy.
+    if not (course_name_lc or course_code_lc):
         return []
 
     matches = []
     for pdf in pdfs:
         pdf_course  = (pdf.get("course", "") or "").lower()
         pdf_subject = (pdf.get("subject", "") or "").lower()
-        pdf_dept    = (pdf.get("department", "") or "").lower()
 
         # Try strongest signals first so match_reason reflects the best hit.
         match_reason = None
         if course_code_lc and pdf_course and course_code_lc in pdf_course:
             match_reason = "course_code"
         elif course_name_lc and (
-            (pdf_course and course_name_lc in pdf_course) or
+            (pdf_course  and course_name_lc in pdf_course) or
             (pdf_subject and course_name_lc in pdf_subject)
         ):
             match_reason = "course_name"
-        elif department_lc and pdf_dept and department_lc in pdf_dept:
-            match_reason = "department"
 
         if not match_reason:
             continue
