@@ -127,11 +127,18 @@ def parse_lecture_plan(text: str) -> dict:
         return {}
 
     try:
+        # NOTE: use .replace(), NOT .format(). The prompt contains literal
+        # JSON curly braces as an example of the desired output shape, and
+        # str.format() would interpret every "{" as a format placeholder
+        # and raise ValueError. That error was silently caught below, which
+        # is why the route kept returning "Could not parse lecture plan"
+        # even for perfectly text-based PDFs.
+        filled_prompt = LECTURE_PLAN_PARSE_PROMPT.replace("{text}", text[:4000])
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{
                 "role": "user",
-                "content": LECTURE_PLAN_PARSE_PROMPT.format(text=text[:4000])
+                "content": filled_prompt
             }],
             temperature=0,
             max_tokens=1000
@@ -145,7 +152,12 @@ def parse_lecture_plan(text: str) -> dict:
                 raw = raw[4:]
         result = json.loads(raw.strip())
         return result if isinstance(result, dict) else {}
-    except Exception:
+    except Exception as e:
+        # Log to stderr so uvicorn shows the real reason on future failures,
+        # instead of silently returning {} and confusing the frontend.
+        import traceback
+        print(f"[parse_lecture_plan] failed: {e}", flush=True)
+        traceback.print_exc()
         return {}
 
 
