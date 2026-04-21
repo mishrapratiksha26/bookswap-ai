@@ -426,29 +426,94 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
                         weighted_sum += vec * rating
                     total_weight += rating
 
-            # Compute final taste vector
+            # -----------------------------------------------------------------
+            # Wishlist contribution to taste vector
+            # -----------------------------------------------------------------
+            # Wishlisted books are an *explicit declared interest* but without
+            # a rating. We treat them as implicit positive signal at weight
+            # WISHLIST_WEIGHT = 4.0 — stronger than an unrated borrow (3.5)
+            # because the user actively saved them, but below a 5-star review
+            # because they haven't actually consumed + enjoyed them yet.
+            #
+            # This is consistent with implicit-feedback literature (Hu et al.
+            # 2008) where declared preferences are treated as positive signal
+            # with a configurable confidence weight.
+            # -----------------------------------------------------------------
+            WISHLIST_WEIGHT = 4.0
+            wishlist_collection = db["wishlists"]
+            books_wishlisted = []
+            try:
+                wishlist_entries = list(wishlist_collection.find({
+                    "user": ObjectId(user_id)
+                }))
+                for entry in wishlist_entries:
+                    book_id = entry.get("book")
+                    if not book_id:
+                        continue
+                    book = books_collection.find_one({"_id": book_id})
+                    if not book:
+                        continue
+
+                    book_id_str = str(book["_id"])
+                    # don't double-count a book the user both borrowed AND wishlisted
+                    if book_id_str in seen_ids:
+                        continue
+                    seen_ids.append(book_id_str)
+
+                    books_wishlisted.append({
+                        "title":  book.get("title", "Unknown"),
+                        "author": book.get("author", ""),
+                        "genre":  book.get("genre", "")
+                    })
+
+                    # genre frequency boost
+                    g = book.get("genre", "").strip()
+                    if g:
+                        genre_freq[g] = genre_freq.get(g, 0) + 1
+
+                    # add wishlisted embedding into the weighted sum
+                    if "vector" in book and book["vector"]:
+                        vec = np.array(book["vector"])
+                        if weighted_sum is None:
+                            weighted_sum = vec * WISHLIST_WEIGHT
+                        else:
+                            weighted_sum += vec * WISHLIST_WEIGHT
+                        total_weight += WISHLIST_WEIGHT
+            except Exception:
+                # wishlist collection may not exist yet in older deployments —
+                # degrade silently, profile still works from borrows alone.
+                pass
+
+            # Compute final taste vector (borrows + wishlist combined)
             taste_vec = None
             if weighted_sum is not None and total_weight > 0:
                 taste_vec = (weighted_sum / total_weight).tolist()
 
             top_genres = sorted(genre_freq, key=genre_freq.get, reverse=True)[:3]
 
-            if books_borrowed:
+            if books_borrowed or books_wishlisted:
+                parts = []
+                if books_borrowed:
+                    parts.append(f"borrowed {len(books_borrowed)} book(s)")
+                if books_wishlisted:
+                    parts.append(f"wishlisted {len(books_wishlisted)} book(s)")
+                recents = [b['title'] for b in (books_borrowed + books_wishlisted)[-3:]]
                 taste_summary = (
-                    f"This student has borrowed {len(books_borrowed)} book(s). "
+                    f"This student has {' and '.join(parts)}. "
                     f"Preferred genres: {', '.join(top_genres) if top_genres else 'varied'}. "
-                    f"Recent reads: {', '.join(b['title'] for b in books_borrowed[-3:])}."
+                    f"Recent interests: {', '.join(recents)}."
                 )
             else:
-                taste_summary = "New user — no borrowing history yet."
+                taste_summary = "New user — no borrowing or wishlist history yet."
 
             return {
-                "books_borrowed": books_borrowed,
+                "books_borrowed":    books_borrowed,
+                "books_wishlisted":  books_wishlisted,
                 "genre_preferences": genre_freq,
-                "top_genres": top_genres,
-                "taste_summary": taste_summary,
-                "taste_vector": taste_vec,        # returned to agent for context
-                "books_already_seen": seen_ids    # agent should exclude these
+                "top_genres":        top_genres,
+                "taste_summary":     taste_summary,
+                "taste_vector":      taste_vec,    # returned to agent for context
+                "books_already_seen": seen_ids     # agent should exclude these
             }
 
         except Exception as e:
