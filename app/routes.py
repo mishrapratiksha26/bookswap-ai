@@ -983,6 +983,73 @@ def embed_pdf_resource(request: EmbedPdfRequest):
     }
 
 
+@router.post("/embed-all-pdfs")
+def embed_all_pdfs(force: bool = False):
+    """
+    Backfill `embedding` + `chapter_headings` for every PDF in the pdfs collection.
+
+    Idempotent: skips PDFs that already have an `embedding` field. Pass
+    ?force=true to re-embed everything (use when embedding model changes
+    or chapter-extraction heuristics improve).
+
+    Why this exists: PDFs uploaded before the /embed-pdf hook was wired,
+    or uploads where the hook failed silently, have no `embedding` →
+    `pdfs_with_vectors` filter in chapter_extractor returns empty →
+    professor-book matching can't hit a student-uploaded Galvin PDF →
+    unit→chapter mapping can't use its TOC. One call to this endpoint
+    fixes all downstream gaps.
+    """
+    import requests as http_requests
+    from app.chapter_extractor import extract_chapter_headings_from_bytes
+
+    pdfs_collection = db["pdfs"]
+    embedded = 0
+    skipped  = 0
+    failed   = 0
+
+    for pdf_doc in pdfs_collection.find({}):
+        if not force and pdf_doc.get("embedding"):
+            skipped += 1
+            continue
+
+        text_for_embedding = (
+            f"{pdf_doc.get('title', '')} "
+            f"{pdf_doc.get('subject', '')} "
+            f"{pdf_doc.get('course', '')} "
+            f"{pdf_doc.get('description', '')}"
+        ).strip()
+        try:
+            embedding = generate_embedding(text_for_embedding)
+        except Exception:
+            failed += 1
+            continue
+
+        chapter_headings = []
+        cloudinary_url = pdf_doc.get("cloudinary_url", "")
+        if cloudinary_url:
+            try:
+                resp = http_requests.get(cloudinary_url, timeout=15)
+                if resp.status_code == 200:
+                    chapter_headings = extract_chapter_headings_from_bytes(resp.content)
+            except Exception:
+                pass   # headings are best-effort, embedding still counts
+
+        pdfs_collection.update_one(
+            {"_id": pdf_doc["_id"]},
+            {"$set": {
+                "embedding": embedding,
+                "chapter_headings": chapter_headings,
+            }}
+        )
+        embedded += 1
+
+    return {
+        "embedded": embedded,
+        "skipped_already_embedded": skipped,
+        "failed": failed,
+    }
+
+
 @router.get("/debug-vectors")
 def debug_vectors():
     results = []
