@@ -674,6 +674,98 @@ def map_units_to_chapters(
 # STEP 7 — Full pipeline entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# STEP 6 — Course-tagged notes search (complements unit matching)
+# ---------------------------------------------------------------------------
+#
+# Motivation: when the professor's recommended textbooks aren't in our
+# inventory AND no PDF matches a unit by semantic similarity, the result
+# page would be empty and useless. BUT — students often upload notes,
+# previous year papers, and reference material tagged to the same course
+# or department. Those still help.
+#
+# This search is metadata-only (no embeddings needed): filter `pdfs`
+# where course / subject / department match the lecture plan's course_name,
+# course_code, or department. Group results by resource_type so the UI can
+# render Notes / Previous Papers / Reference as separate rows.
+#
+# Thesis framing (Chapter 3): complements semantic unit→chapter matching
+# with a "peer-uploaded material" retrieval path — same query, different
+# retrieval signal (structured metadata vs dense vector similarity).
+
+def find_course_related_notes(
+    course_name: str,
+    course_code: str,
+    department: str,
+    pdfs: list[dict] | None,
+    limit_per_type: int = 3,
+) -> list[dict]:
+    """
+    Find PDFs tagged to the lecture plan's course or department.
+
+    Match on any of (case-insensitive substring):
+      - pdf.course        ⊇ course_code  or  course_name
+      - pdf.subject       ⊇ course_name
+      - pdf.department    ⊇ department
+
+    Returns flat list (grouped/capped per resource_type) — UI groups for display.
+    """
+    if not pdfs:
+        return []
+
+    course_name_lc = (course_name or "").strip().lower()
+    course_code_lc = (course_code or "").strip().lower()
+    department_lc  = (department or "").strip().lower()
+
+    # Nothing to match against → nothing to return
+    if not (course_name_lc or course_code_lc or department_lc):
+        return []
+
+    matches = []
+    for pdf in pdfs:
+        pdf_course  = (pdf.get("course", "") or "").lower()
+        pdf_subject = (pdf.get("subject", "") or "").lower()
+        pdf_dept    = (pdf.get("department", "") or "").lower()
+
+        # Try strongest signals first so match_reason reflects the best hit.
+        match_reason = None
+        if course_code_lc and pdf_course and course_code_lc in pdf_course:
+            match_reason = "course_code"
+        elif course_name_lc and (
+            (pdf_course and course_name_lc in pdf_course) or
+            (pdf_subject and course_name_lc in pdf_subject)
+        ):
+            match_reason = "course_name"
+        elif department_lc and pdf_dept and department_lc in pdf_dept:
+            match_reason = "department"
+
+        if not match_reason:
+            continue
+
+        matches.append({
+            "pdf_id":         str(pdf.get("_id", "")),
+            "title":          pdf.get("title", ""),
+            "subject":        pdf.get("subject", ""),
+            "course":         pdf.get("course", ""),
+            "department":     pdf.get("department", ""),
+            "professor":      pdf.get("professor", ""),
+            "resource_type":  pdf.get("resource_type", "notes"),
+            "cloudinary_url": pdf.get("cloudinary_url", ""),
+            "match_reason":   match_reason,
+        })
+
+    # Cap per resource_type so one flooded category doesn't crowd others.
+    by_type: dict[str, list[dict]] = {}
+    for m in matches:
+        by_type.setdefault(m["resource_type"], []).append(m)
+
+    trimmed = []
+    for items in by_type.values():
+        trimmed.extend(items[:limit_per_type])
+
+    return trimmed
+
+
 def process_curriculum_pdf(
     pdf_bytes: bytes,
     books: list[dict],
@@ -752,6 +844,17 @@ def process_curriculum_pdf(
     # Step B: map each unit to best chapter (professor books first, fallback second)
     unit_matches = map_units_to_chapters(units, books, preferred_book_ids=found_ids, pdfs=pdfs)
 
+    # Step C: peer-uploaded notes / PYQs / reference tagged to this course or dept.
+    # Runs regardless of unit-matching outcome — surfaces material even when the
+    # semantic matcher finds nothing (common on the day a new lecture plan is
+    # uploaded and no student has posted a matching textbook yet).
+    related_notes = find_course_related_notes(
+        course_name=parsed.get("course_name", ""),
+        course_code=parsed.get("course_code", ""),
+        department=parsed.get("department", ""),
+        pdfs=pdfs,
+    )
+
     # Append run record for thesis Chapter 5 — happens AFTER all matching so we
     # capture the full end-to-end outcome, not just what the LLM parsed.
     log_curriculum_run(
@@ -770,6 +873,13 @@ def process_curriculum_pdf(
         "department":        parsed.get("department", ""),
         "recommended_books": recommended_books,
         "unit_matches":      unit_matches,
+        "related_notes":     related_notes,   # PDFs tagged to this course/dept
+        # n_units_parsed lets the UI tell apart two failure modes:
+        #   (a) Groq couldn't parse any units from the PDF (scanned, garbled)
+        #   (b) Units parsed fine but inventory had no matching book/PDF
+        # Without this, both show the same "couldn't extract units" message
+        # and we misdiagnose inventory gaps as parse failures.
+        "n_units_parsed":    len(parsed.get("units", []) or []),
         "prompt_version":    active_version,
         "error":             None,
     }

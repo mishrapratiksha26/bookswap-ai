@@ -824,17 +824,32 @@ def agent(request: AgentRequest):
 # ---------------------------------------------------------------------------
 
 @router.post("/embed-all")
-def embed_all():
-    count = 0
+def embed_all(force: bool = False):
+    """
+    Backfill vector embeddings for every book in the inventory.
+
+    Idempotent: skips books that already have a non-empty `vector` field so
+    it's safe to re-run on every deploy. Pass ?force=true to re-embed
+    everything (use when the embedding model changes).
+
+    This is the fix for "all books show 'Not in library'" — seeded books
+    have no vector, so `books_with_vectors` filter in chapter_extractor
+    returns an empty list → every match falls through.
+    """
+    embedded = 0
+    skipped  = 0
     for book in books_collection.find({}):
+        if not force and book.get("vector"):
+            skipped += 1
+            continue
         text = f"{book.get('title', '')} {book.get('author', '')} {book.get('genre', '')} {book.get('description', '')}"
         vector = generate_embedding(text)
         books_collection.update_one(
             {"_id": book["_id"]},
             {"$set": {"vector": vector}}
         )
-        count += 1
-    return {"message": f"Embedded {count} books"}
+        embedded += 1
+    return {"embedded": embedded, "skipped_already_embedded": skipped}
 
 @router.post("/search")
 def search(request: SearchRequest):
