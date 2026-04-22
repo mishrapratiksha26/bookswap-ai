@@ -12,3 +12,7 @@ server_test.log
 # Commit *frozen* snapshots into experiments/snapshots/ instead.
 experiments/*.jsonl
 !experiments/snapshots/**
+
+# Cached catalogue PDFs from IIT ISM scraper (re-downloadable from their site).
+# The parsed courses.json IS committed so the app has a canonical list offline.
+data/iitism_courses/
