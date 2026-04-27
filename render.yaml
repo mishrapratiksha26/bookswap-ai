@@ -1,29 +1,29 @@
 # Render service config for the BookSwap FastAPI backend.
 #
-# Two non-default things this file does:
+# Runtime: Docker. We switched away from Render's standard Python runtime
+# because that runtime sandboxes apt-get during the build phase, which
+# made it impossible to install Tesseract for the scanned-PDF OCR path.
+# Docker gives the build full root access, so the Dockerfile installs
+# tesseract-ocr + tesseract-ocr-eng during the image build and the OCR
+# fallback in chapter_extractor.py works on Render exactly as it does
+# on the developer's laptop.
 #
-#   1. Installs Tesseract OCR via apt-get during the build phase. PyMuPDF's
-#      get_textpage_ocr() uses the system Tesseract binary; without this
-#      step the OCR fallback for scanned lecture-plan PDFs raises
-#      "RuntimeError: No tessdata specified" on Render.
+# IMPORTANT: this file is only auto-applied when the service is created
+# via Render's Blueprint flow ("New + → Blueprint"). If the service was
+# created the old way ("New + → Web Service") and is still configured as
+# Python runtime, you must either:
+#   (a) recreate it via Blueprint pointing at this repo, OR
+#   (b) in the dashboard, change the service's "Language / Runtime" to
+#       Docker — Render then uses ./Dockerfile and ignores buildCommand.
 #
-#   2. Sets TESSDATA_PREFIX so PyMuPDF can locate the language files
-#      installed by the apt package (Render's Linux base image puts them
-#      at /usr/share/tesseract-ocr/<version>/tessdata).
-#
-# Secrets (DB_URL, GROQ_API_KEY) are sync:false — set them manually in the
-# Render dashboard. Anything with `value:` is committed to the repo and is
-# safe to be public.
+# Secrets (DB_URL, GROQ_API_KEY) are sync:false — set them in the Render
+# dashboard. Anything with `value:` is safe to be public.
 services:
   - type: web
     name: bookswap-ai
-    env: python
+    runtime: docker
     plan: free
-    buildCommand: |
-      apt-get update && \
-      apt-get install -y tesseract-ocr tesseract-ocr-eng && \
-      pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: DB_URL
         sync: false        # set manually in Render dashboard (Atlas connection string)
@@ -31,7 +31,7 @@ services:
         value: test
       - key: GROQ_API_KEY
         sync: false        # set manually in Render dashboard
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: TESSDATA_PREFIX
-        value: /usr/share/tesseract-ocr/5/tessdata
+      # TESSDATA_PREFIX is set inside the Dockerfile (ENV instruction)
+      # so it travels with the image, not via Render's env-var injection.
+      # PYTHON_VERSION is pinned by the FROM line in the Dockerfile, not
+      # here — both kept in one place reduces drift.

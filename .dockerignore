@@ -1,0 +1,43 @@
+# Files / dirs excluded from the Docker build context.
+#
+# Anything listed here is NOT copied into the image when `COPY . .` runs.
+# Goal: keep the image small (faster Render deploys, less network egress)
+# and keep secrets out of layers a future curl can read off Docker Hub.
+
+# Python bytecode / venv — must be regenerated against the image's Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+
+# Local dev artefacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Git history — Docker doesn't need it, and `git` is not even installed
+# in the slim base image. Cuts ~60 MB out of the build context.
+.git/
+.gitignore
+
+# Local secrets — must NEVER end up in the image
+.env
+.env.*
+!.env.example
+
+# Documentation that the runtime doesn't need
+*.md
+README*
+docs/
+
+# Thesis-time evaluation artefacts that are NOT served at runtime.
+# Eval scripts run locally against the prod DB, not from inside the
+# container. Experiments folder holds JSONL run logs that belong on the
+# developer's laptop, not the prod image.
+scripts/
+experiments/
