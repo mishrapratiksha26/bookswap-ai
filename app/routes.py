@@ -18,6 +18,26 @@ router = APIRouter()
 client = MongoClient(os.environ.get("DB_URL"))
 db = client[os.environ.get("DB_NAME", "books")]
 books_collection = db["books"]
+
+# ---------------------------------------------------------------------------
+# Retrieval quality floors (Chapter 3 §3.3 — Two-stage retrieval, LlamaRec-style)
+#
+# Every retrieval surface in BookSwap (semantic_search tool, /search endpoint,
+# curriculum unit-fallback) checks that the top cosine candidate clears a
+# minimum similarity before returning anything. Below the floor we return an
+# empty result rather than the least-dissimilar noise.
+#
+# Empirically tuned after user-test feedback ("Harry Potter showed Operating
+# Systems books"): pure cosine top-K against an inventory with no thrillers
+# returns OS textbooks at 0.15-0.20 sim — technically the best match, but the
+# best of nothing. SEARCH_COSINE_FLOOR = 0.30 keeps clearly relevant matches
+# while filtering out-of-distribution queries.
+# ---------------------------------------------------------------------------
+SEARCH_COSINE_FLOOR  = 0.30   # below this → return empty
+SEARCH_COSINE_BYPASS = 0.70   # above this → cosine is conclusive, skip LLM filter
+                              # (keeps clear title matches like "silent patient"
+                              # → "The Silent Patient" from being rejected by an
+                              # over-cautious relevance prompt)
 conversations_collection = db["conversations"]
 
 # TTL index on last_active — MongoDB auto-deletes sessions idle > 30 minutes.
@@ -217,13 +237,48 @@ tools = [
 
 def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weights=None):
     if tool_name == "semantic_search":
+        from app.chapter_extractor import llm_filter_search_results
+
         books = list(books_collection.find({}))
-        # Step 1: semantic similarity search (returns up to 5*2 candidates for re-ranking)
+
+        # Stage 1: cosine top-K shortlist
         candidates = search_books(tool_args["query"], books, top_k=10)
-        # Step 2: re-rank using 5-component formula (Phase 4)
-        # taste_vector is None for anonymous users — cold start gracefully defaults to 0.5
-        reranked = rerank_books(candidates, taste_vector=taste_vector, weights=rerank_weights)
-        # Return top 5 after re-ranking
+
+        # Stage 1b: cosine floor (cheap first-pass filter — kills out-of-domain queries)
+        top_score = candidates[0].get("score", 0.0) if candidates else 0.0
+        if not candidates or top_score < SEARCH_COSINE_FLOOR:
+            return []
+
+        # Stage 1c: decisive-cosine bypass.
+        # When top-1 cosine is high (≥ SEARCH_COSINE_BYPASS) the user has
+        # named a specific book or author — "gone girl", "silent patient",
+        # "harry potter". The 5-component re-ranker is designed for browse-
+        # like queries where availability and popularity legitimately break
+        # ties; applied to a direct title query it can demote the actual
+        # named book below an unrelated but more-borrowed title. Here we
+        # honour cosine ordering directly, with availability as a tie-
+        # breaker only when cosine values are effectively equal.
+        if top_score >= SEARCH_COSINE_BYPASS:
+            sorted_by_cosine = sorted(
+                candidates,
+                key=lambda b: (b.get("score", 0.0),
+                               1.0 if b.get("available", True) else 0.0),
+                reverse=True,
+            )
+            return sorted_by_cosine[:5]
+
+        # Stage 2: LLM relevance filter — only when cosine is borderline.
+        # This is where Harry-Potter-type proper-noun queries can register
+        # middling cosine against unrelated titles and need a real semantic
+        # check before re-ranking.
+        keep_indices = llm_filter_search_results(tool_args["query"], candidates)
+        if not keep_indices:
+            return []
+        filtered = [candidates[i] for i in keep_indices]
+
+        # Stage 3: re-rank using 5-component formula (Phase 4).
+        # taste_vector is None for anonymous users — cold-start defaults context to 0.5.
+        reranked = rerank_books(filtered, taste_vector=taste_vector, weights=rerank_weights)
         return reranked[:5]
 
     elif tool_name == "check_availability":
@@ -853,9 +908,41 @@ def embed_all(force: bool = False):
 
 @router.post("/search")
 def search(request: SearchRequest):
+    """
+    Search-bar endpoint hit by Node.js GET /books?query=...
+
+    Architectural choice (thesis §3.3): the search bar returns *pure
+    relevance* ordering — cosine top-K with a small floor as a safety net.
+    The 5-component re-ranker is not applied here. Two reasons:
+
+      1. A user typing "gone girl" or "silent patient" has named a target.
+         Re-ranking by availability/popularity legitimately serves browse-
+         style queries but demotes the named book on direct queries —
+         exactly the failure mode user testing surfaced before this revert.
+      2. The retrieval/recommendation distinction (Burke, 2002): pure
+         cosine top-K is *retrieval*; multi-signal scoring is
+         *recommendation*. The chat agent (semantic_search tool) is the
+         recommendation surface in BookSwap; the search bar stays as a
+         retrieval surface. Splitting them keeps each surface's behaviour
+         predictable and matches what users expect from a search box.
+
+    The cosine floor (SEARCH_COSINE_FLOOR) is kept because it's a one-
+    comparison guard against out-of-distribution queries — e.g. searching
+    "Harry Potter" when the inventory has no fiction. Without it, raw
+    cosine still returns the least-dissimilar result at noise-level
+    similarity, which the user-testing tester correctly identified as
+    misleading. With the floor, those queries return empty and the UI's
+    "no results" state takes over honestly.
+    """
     books = list(books_collection.find({}))
-    results = search_books(request.query, books, request.top_k)
-    return {"results": results}
+    candidates = search_books(request.query, books, top_k=request.top_k)
+
+    # Out-of-distribution guard. One cheap float comparison. Below the
+    # floor every candidate is noise; return empty rather than mislead.
+    if not candidates or candidates[0].get("score", 0.0) < SEARCH_COSINE_FLOOR:
+        return {"results": []}
+
+    return {"results": candidates}
 
 @router.post("/embed-book")
 def embed_book(request: EmbedRequest):
@@ -1047,6 +1134,78 @@ def embed_all_pdfs(force: bool = False):
         "embedded": embedded,
         "skipped_already_embedded": skipped,
         "failed": failed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# /rescan-pdf-chapters — re-run chapter extraction on a single existing PDF.
+#
+# Why this exists: the default `extract_chapter_headings_from_bytes()` run
+# at upload time stores ONLY Tier 2a (embedded TOC) entries — chapter-level
+# granularity. For curriculum matching we sometimes want Tier 2b (font-scan)
+# subsection headings as well, which are off by default (experimental, slower).
+#
+# This endpoint downloads the PDF from Cloudinary again and re-extracts with
+# the include_page_scan flag, so we don't have to re-upload the file.
+# Used for thesis §3.7 Tier 2b ablation: compare curriculum match accuracy
+# with vs without font-scan enabled.
+# ---------------------------------------------------------------------------
+class RescanRequest(BaseModel):
+    pdf_id: str
+    include_page_scan: bool = False
+
+
+@router.post("/rescan-pdf-chapters")
+def rescan_pdf_chapters(request: RescanRequest):
+    """
+    Re-run chapter_headings extraction on a single PDF.
+
+    Body: { "pdf_id": "<ObjectId>", "include_page_scan": true }
+    Returns: number of headings found + first 20 as a sample so we can eyeball
+    them in Swagger before trusting the update.
+    """
+    import requests as http_requests
+    from bson import ObjectId
+    from app.chapter_extractor import extract_chapter_headings_from_bytes
+
+    pdfs_collection = db["pdfs"]
+    try:
+        pdf_doc = pdfs_collection.find_one({"_id": ObjectId(request.pdf_id)})
+    except Exception:
+        return {"error": "Invalid pdf_id"}
+    if not pdf_doc:
+        return {"error": "PDF document not found"}
+
+    cloudinary_url = pdf_doc.get("cloudinary_url", "")
+    if not cloudinary_url:
+        return {"error": "No cloudinary_url on PDF document"}
+
+    try:
+        resp = http_requests.get(cloudinary_url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        return {"error": f"Could not download PDF: {e}"}
+
+    headings = extract_chapter_headings_from_bytes(
+        resp.content,
+        include_page_scan=request.include_page_scan,
+    )
+
+    pdfs_collection.update_one(
+        {"_id": ObjectId(request.pdf_id)},
+        {"$set": {"chapter_headings": headings}}
+    )
+
+    return {
+        "ok": True,
+        "pdf_id": request.pdf_id,
+        "title": pdf_doc.get("title", ""),
+        "chapters_found": len(headings),
+        "include_page_scan": request.include_page_scan,
+        "sample": [
+            {"title": h.get("title"), "page": h.get("page")}
+            for h in headings[:20]
+        ],
     }
 
 

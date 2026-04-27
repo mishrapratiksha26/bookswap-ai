@@ -1,15 +1,37 @@
+# Render service config for the BookSwap FastAPI backend.
+#
+# Two non-default things this file does:
+#
+#   1. Installs Tesseract OCR via apt-get during the build phase. PyMuPDF's
+#      get_textpage_ocr() uses the system Tesseract binary; without this
+#      step the OCR fallback for scanned lecture-plan PDFs raises
+#      "RuntimeError: No tessdata specified" on Render.
+#
+#   2. Sets TESSDATA_PREFIX so PyMuPDF can locate the language files
+#      installed by the apt package (Render's Linux base image puts them
+#      at /usr/share/tesseract-ocr/<version>/tessdata).
+#
+# Secrets (DB_URL, GROQ_API_KEY) are sync:false — set them manually in the
+# Render dashboard. Anything with `value:` is committed to the repo and is
+# safe to be public.
 services:
   - type: web
     name: bookswap-ai
     env: python
-    buildCommand: pip install -r requirements.txt
+    plan: free
+    buildCommand: |
+      apt-get update && \
+      apt-get install -y tesseract-ocr tesseract-ocr-eng && \
+      pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DB_URL
-        sync: false        # set manually in Render dashboard
+        sync: false        # set manually in Render dashboard (Atlas connection string)
       - key: DB_NAME
         value: test
       - key: GROQ_API_KEY
         sync: false        # set manually in Render dashboard
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: TESSDATA_PREFIX
+        value: /usr/share/tesseract-ocr/5/tessdata
