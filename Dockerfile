@@ -63,8 +63,22 @@ WORKDIR /app
 # source (the much more common case) does not invalidate the pip-install
 # layer. Builds drop from ~7 min to ~30 sec on most code-only changes.
 COPY requirements.txt .
-RUN pip install --upgrade pip \
- && pip install -r requirements.txt
+RUN pip install --upgrade pip
+
+# Install CPU-only torch FIRST, before requirements.txt resolves it as a
+# transitive dependency of sentence-transformers. By default torch on
+# PyPI now ships the CUDA build, which pulls in ~2 GB of nvidia-cublas /
+# nvidia-cudnn / triton / cuda-toolkit packages. We do CPU inference
+# only on Render — the GPU bytes are wasted and they OOM the free
+# plan's 512 MB container before uvicorn can bind the port. Pinning to
+# PyTorch's CPU wheel index keeps the install ~10× smaller and the
+# runtime memory footprint well inside the 512 MB cap. When the
+# subsequent `pip install -r requirements.txt` evaluates torch as a
+# transitive dep, it sees the CPU build already satisfies the
+# constraint and skips the heavyweight CUDA install.
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install -r requirements.txt
 
 # --- Application source ------------------------------------------------------
 COPY . .
