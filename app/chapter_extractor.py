@@ -515,7 +515,26 @@ def extract_chapter_headings_from_bytes(
             if len(headings) >= 50:
                 break
     else:
-        # --- Fallback: heuristic text-block scan (pre-existing behaviour) ---
+        # --- Fallback: heuristic text-block scan (tightened after user
+        # testing surfaced single-character "headings" like "B", "Solid",
+        # "P", "O x" — column headers and stray text blocks that
+        # mistakenly passed the old "starts with uppercase, <= 8 words"
+        # rule).
+        #
+        # New rules — match only obvious chapter-like patterns:
+        #   1. Starts with "Chapter | Unit | Section | Part | Module"
+        #      followed by whitespace and a non-trivial title, OR
+        #   2. Starts with a numeric prefix like "1.", "1.1", "5.3.2"
+        #      followed by whitespace and at least one word of content.
+        #
+        # Both rules require the line to be 8-100 chars long and contain
+        # at least 5 alpha characters — kills viscosity-table cells and
+        # other short, mostly-symbol, sub-page-text junk.
+        # ---------------------------------------------------------------
+        import re
+        CHAPTER_PREFIX_RE  = re.compile(r'^(chapter|unit|section|part|module)\s+\S', re.IGNORECASE)
+        NUMBERED_PREFIX_RE = re.compile(r'^\d+(\.\d+)*\s+\w{2,}')
+
         for page_num, page in enumerate(doc):
             if page_num > 30:
                 break
@@ -525,14 +544,13 @@ def extract_chapter_headings_from_bytes(
                 continue
             for block in blocks:
                 text = block[4].strip() if len(block) > 4 else ""
-                if not text or len(text) > 100:
+                if not (8 <= len(text) <= 100):
                     continue
-                is_chapter = (
-                    text.lower().startswith(("chapter", "unit", "section", "part", "module"))
-                    or text[:2].isdigit()
-                    or (text[0].isupper() and len(text.split()) <= 8)
-                )
-                if is_chapter and text not in seen_title:
+                if sum(1 for c in text if c.isalpha()) < 5:
+                    continue
+                if not (CHAPTER_PREFIX_RE.match(text) or NUMBERED_PREFIX_RE.match(text)):
+                    continue
+                if text not in seen_title:
                     headings.append({"title": text, "page": None})
                     seen_title.add(text)
                 if len(headings) >= 30:
