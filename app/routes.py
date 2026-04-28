@@ -206,7 +206,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "search_pdfs",
-            "description": "Search the BookSwap digital PDF library (notes, textbooks, previous year papers, reference material). Call this when the user asks for soft copies, PDFs, notes, or study material.",
+            "description": "Search the BookSwap digital PDF library — student-uploaded notes, textbook soft copies, previous year question papers, reference PDFs, and study material. ALWAYS call this whenever a query is even loosely academic: any mention of a course (\"fluid machines\", \"OS\", \"DBMS\"), subject, professor, exam, semester, or study help. Treat physical books and PDFs as TWO PARALLEL inventories — for academic queries, call both this and `semantic_search` and merge the results in your response. Only skip this tool when the query is clearly about a leisure-fiction title (\"Harry Potter\", \"a thriller for the weekend\").",
             "parameters": {
                 "type": "object",
                 "properties": {
