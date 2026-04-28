@@ -911,38 +911,56 @@ def search(request: SearchRequest):
     """
     Search-bar endpoint hit by Node.js GET /books?query=...
 
-    Architectural choice (thesis §3.3): the search bar returns *pure
-    relevance* ordering — cosine top-K with a small floor as a safety net.
-    The 5-component re-ranker is not applied here. Two reasons:
+    Architectural choice (thesis §3.3 — revised after user testing
+    surfaced "inspirational books" returning Verity / Project Hail Mary
+    / a probability textbook instead of Atomic Habits):
 
-      1. A user typing "gone girl" or "silent patient" has named a target.
-         Re-ranking by availability/popularity legitimately serves browse-
-         style queries but demotes the named book on direct queries —
-         exactly the failure mode user testing surfaced before this revert.
-      2. The retrieval/recommendation distinction (Burke, 2002): pure
-         cosine top-K is *retrieval*; multi-signal scoring is
-         *recommendation*. The chat agent (semantic_search tool) is the
-         recommendation surface in BookSwap; the search bar stays as a
-         retrieval surface. Splitting them keeps each surface's behaviour
-         predictable and matches what users expect from a search box.
+    Two-stage retrieval at the search bar, with a high-cosine bypass
+    for direct queries.
 
-    The cosine floor (SEARCH_COSINE_FLOOR) is kept because it's a one-
-    comparison guard against out-of-distribution queries — e.g. searching
-    "Harry Potter" when the inventory has no fiction. Without it, raw
-    cosine still returns the least-dissimilar result at noise-level
-    similarity, which the user-testing tester correctly identified as
-    misleading. With the floor, those queries return empty and the UI's
-    "no results" state takes over honestly.
+      Stage 1  — cosine top-K shortlist + floor (rejects out-of-domain
+                  queries like "Harry Potter" against an OS-only inventory)
+      Stage 1c — decisive-cosine bypass: when the top match has cosine
+                  >= SEARCH_COSINE_BYPASS, the user has named a target
+                  ("gone girl" -> Gone Girl) and the LLM filter would
+                  only second-guess it. Skip Stage 2.
+      Stage 2  — LLM relevance filter for borderline cosine. This is
+                  where vague topic queries ("inspirational books",
+                  "thrillers", "easy read") need a semantic check
+                  beyond word-level cosine, because cosine on a 384-dim
+                  Sentence-BERT embedding is sensitive to vocabulary
+                  drift (e.g. "inspirational" embedding does not strongly
+                  correlate with "habits productivity behaviour change",
+                  even though Atomic Habits is the canonical inspirational
+                  book in our inventory).
+
+    No re-ranking on this surface — that lives on the chat-agent's
+    semantic_search tool only. See thesis §3.3 for the retrieval-vs-
+    recommendation split (Burke, 2002).
     """
-    books = list(books_collection.find({}))
-    candidates = search_books(request.query, books, top_k=request.top_k)
+    from app.chapter_extractor import llm_filter_search_results
 
-    # Out-of-distribution guard. One cheap float comparison. Below the
-    # floor every candidate is noise; return empty rather than mislead.
-    if not candidates or candidates[0].get("score", 0.0) < SEARCH_COSINE_FLOOR:
+    books = list(books_collection.find({}))
+    candidates = search_books(request.query, books, top_k=10)
+
+    # Out-of-distribution guard. One cheap float comparison.
+    top_score = candidates[0].get("score", 0.0) if candidates else 0.0
+    if not candidates or top_score < SEARCH_COSINE_FLOOR:
         return {"results": []}
 
-    return {"results": candidates}
+    # Decisive-cosine bypass: if cosine alone is conclusive, skip the
+    # LLM call (saves ~400 ms latency on direct title/author queries).
+    if top_score >= SEARCH_COSINE_BYPASS:
+        return {"results": candidates[: request.top_k]}
+
+    # LLM relevance filter. Returns the indices of candidates that the
+    # LLM judges genuinely relevant; if the LLM rejects all, return
+    # empty so the UI shows "no results" honestly rather than noise.
+    keep_indices = llm_filter_search_results(request.query, candidates)
+    if not keep_indices:
+        return {"results": []}
+    filtered = [candidates[i] for i in keep_indices]
+    return {"results": filtered[: request.top_k]}
 
 @router.post("/embed-book")
 def embed_book(request: EmbedRequest):
@@ -1290,6 +1308,82 @@ async def curriculum_match(
         pdf_filename=file.filename,      # logged for thesis reproducibility
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# /compress-pdf — lossless PDF compression for the upload pipeline.
+#
+# Why this exists:
+#   Cloudinary's free tier rejects raw uploads larger than 10 MB. Real
+#   textbooks scan to 20-50 MB, which the user can't be expected to
+#   compress by hand before every upload. The Node side runs every PDF
+#   upload through this endpoint when its size is above ~9.5 MB; we
+#   apply PyMuPDF's lossless deflate options (garbage collection +
+#   stream + image + font deflate + clean) and return the compressed
+#   bytes so Node can push them on to Cloudinary.
+#
+# Lossy compression (rendering pages as JPEGs) is deliberately NOT
+# attempted here even when lossless isn't enough. Reason: the curriculum
+# matcher in §3.7 depends on extractable text and embedded TOCs;
+# replacing pages with rasterised images would silently break that
+# feature for every aggressively-compressed upload. When lossless
+# isn't enough, we return 413 with a clear message asking the user
+# to compress externally — that is honest and preserves downstream
+# functionality.
+# ---------------------------------------------------------------------------
+from fastapi.responses import Response, JSONResponse
+
+@router.post("/compress-pdf")
+async def compress_pdf(file: UploadFile = File(...)):
+    import io
+    pdf_bytes = await file.read()
+    original_size = len(pdf_bytes)
+    target_bytes = int(9.5 * 1024 * 1024)   # under Cloudinary's 10 MB cap
+
+    # Already small enough — return as-is, no work to do.
+    if original_size <= target_bytes:
+        return Response(content=pdf_bytes, media_type="application/pdf")
+
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        out = io.BytesIO()
+        doc.save(
+            out,
+            garbage=4,           # full xref garbage collection
+            deflate=True,        # compress streams
+            deflate_images=True, # compress embedded images
+            deflate_fonts=True,  # compress embedded fonts
+            clean=True,          # remove redundant content
+        )
+        doc.close()
+        compressed = out.getvalue()
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Compression failed: {type(e).__name__}: {e}"},
+        )
+
+    if len(compressed) <= target_bytes:
+        return Response(content=compressed, media_type="application/pdf")
+
+    # Lossless wasn't enough. Refuse rather than silently degrade.
+    return JSONResponse(
+        status_code=413,
+        content={
+            "error": "PDF still exceeds 10 MB after lossless compression",
+            "original_mb":   round(original_size / 1024 / 1024, 1),
+            "compressed_mb": round(len(compressed)  / 1024 / 1024, 1),
+            "limit_mb":      10,
+            "suggestion": (
+                "Use a desktop tool such as iLovePDF, Smallpdf, or Adobe "
+                "Acrobat's compression preset to reduce the file further "
+                "before uploading. Aggressive in-pipeline compression would "
+                "render the PDF as images and break the curriculum-matcher's "
+                "text-extraction step."
+            ),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -150,10 +150,24 @@ def extract_text_from_bytes(pdf_bytes: bytes, *, allow_ocr: bool = True) -> str:
                     # tessdata=... is the key fix. Without it, PyMuPDF only
                     # checks the TESSDATA_PREFIX env var, which is brittle
                     # on Windows. We pass the resolved path directly.
+                    #
+                    # DPI tuning: Tesseract's peak memory scales roughly
+                    # quadratically with DPI. 300 DPI on a 1-page A4 scan
+                    # spikes to ~120 MB; 150 DPI to ~50 MB. The drop is
+                    # what lets the call fit under Render's free-tier 512 MB
+                    # cap (steady state with model loaded is ~380 MB, so
+                    # 300 DPI tipped over while 150 DPI does not). Recall
+                    # quality on lecture-plan-style scans (typed body text,
+                    # no handwriting, decent contrast) is essentially
+                    # identical between 150 and 300 DPI. Bumped back up
+                    # to 300 if/when the service moves to a paid plan
+                    # with more RAM headroom — the env var below makes
+                    # that a one-line change.
+                    ocr_dpi = int(os.environ.get("OCR_DPI", "150"))
                     tp = page.get_textpage_ocr(
                         flags=0,
                         language="eng",
-                        dpi=300,            # higher dpi = slower but better recall
+                        dpi=ocr_dpi,
                         full=True,          # OCR the whole page
                         tessdata=_TESSDATA_PATH,
                     )
