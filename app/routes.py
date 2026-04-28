@@ -206,7 +206,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "search_pdfs",
-            "description": "Search the BookSwap digital PDF library — student-uploaded notes, textbook soft copies, previous year question papers, reference PDFs, and study material. ALWAYS call this whenever a query is even loosely academic: any mention of a course (\"fluid machines\", \"OS\", \"DBMS\"), subject, professor, exam, semester, or study help. Treat physical books and PDFs as TWO PARALLEL inventories — for academic queries, call both this and `semantic_search` and merge the results in your response. Only skip this tool when the query is clearly about a leisure-fiction title (\"Harry Potter\", \"a thriller for the weekend\").",
+            "description": "Search the BookSwap digital PDF library — student-uploaded notes, textbook soft copies, previous year question papers, reference PDFs, leisure books in PDF form, and any other digital resource. ALWAYS call this in parallel with `semantic_search` for EVERY book-related query, regardless of whether it sounds academic, leisure, or vague. Physical books and PDFs are two parallel inventories on the BookSwap platform; calling only one of them produces a structurally incomplete answer. Skip this tool only for off-topic queries (math homework, weather, etc.) where no book would be relevant either way.",
             "parameters": {
                 "type": "object",
                 "properties": {
