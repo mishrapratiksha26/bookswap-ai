@@ -459,6 +459,69 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
 
             top_genres = sorted(genre_freq, key=genre_freq.get, reverse=True)[:3]
 
+            # -----------------------------------------------------------------
+            # Cold-start: department-based taste-vector initialisation
+            # (thesis §3.3.4 — "graceful cold-start handling")
+            # -----------------------------------------------------------------
+            # If the user has no borrow OR wishlist history, taste_vec is
+            # still None at this point and the re-ranker will fall back to
+            # context = 0.5 (neutral). That is graceful but uninformative.
+            #
+            # We can do better when the user registered with a department:
+            # compute the rating-weighted centroid of books in their
+            # department and use that as a starting taste vector. The user's
+            # very first /agent call therefore gets recommendations leaning
+            # toward their stated academic interest, even before they have
+            # touched a single book.
+            #
+            # Set when get_user_profile is called as a tool, NOT pre-computed
+            # at registration time, so a department change picked up via the
+            # profile page (future feature) is reflected immediately.
+            #
+            # Honest framing: this is informed-prior initialisation, not real
+            # personalisation. taste_summary makes the source explicit so the
+            # downstream LLM can phrase recommendations as "based on your
+            # department" rather than misrepresenting them as "based on your
+            # reading history."
+            cold_start_seeded_from_dept = False
+            user_dept = ""
+            if taste_vec is None:
+                from bson import ObjectId as _OID  # already imported above; alias for clarity
+                try:
+                    user_doc = db["users"].find_one({"_id": _OID(user_id)})
+                except Exception:
+                    user_doc = None
+                user_dept = ((user_doc or {}).get("department") or "").strip()
+
+                if user_dept:
+                    # Match books whose `department` field contains the user's
+                    # department code as a substring (case-insensitive). Catches
+                    # both "CSE" and "Computer Science and Engineering" stored
+                    # styles without forcing the upload form to converge on one.
+                    dept_books = list(books_collection.find({
+                        "department": {"$regex": user_dept, "$options": "i"}
+                    }))
+                    dept_weighted = None
+                    dept_total    = 0.0
+                    n_seeded      = 0
+                    for b in dept_books:
+                        if "vector" not in b or not b["vector"]:
+                            continue
+                        r = float(b.get("avg_rating") or 3.5)
+                        v = np.array(b["vector"]) * r
+                        if dept_weighted is None:
+                            dept_weighted = v
+                        else:
+                            dept_weighted += v
+                        dept_total += r
+                        n_seeded   += 1
+
+                    if dept_weighted is not None and dept_total > 0:
+                        taste_vec = (dept_weighted / dept_total).tolist()
+                        cold_start_seeded_from_dept = True
+                        # tucked into the dict via the new `cold_start_source`
+                        # field below so the agent can reference it honestly.
+
             if books_borrowed or books_wishlisted:
                 parts = []
                 if books_borrowed:
@@ -471,8 +534,28 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
                     f"Preferred genres: {', '.join(top_genres) if top_genres else 'varied'}. "
                     f"Recent interests: {', '.join(recents)}."
                 )
+            elif cold_start_seeded_from_dept:
+                taste_summary = (
+                    f"New user from the {user_dept} department — no borrowing "
+                    f"history yet, but taste vector seeded from the average "
+                    f"of well-rated books in their department. Recommendations "
+                    f"will lean academic at first; they will adjust as the "
+                    f"user borrows or wishlists actual books."
+                )
             else:
                 taste_summary = "New user — no borrowing or wishlist history yet."
+
+            # cold_start_source records the *origin* of taste_vec so the
+            # agent can phrase recommendations honestly:
+            #   "history"    — from real borrows / wishlist (always preferred)
+            #   "department" — informed prior from the user's stated department
+            #   "none"       — taste_vec is None; re-ranker will fall back to 0.5
+            if books_borrowed or books_wishlisted:
+                cold_start_source = "history"
+            elif cold_start_seeded_from_dept:
+                cold_start_source = "department"
+            else:
+                cold_start_source = "none"
 
             return {
                 "books_borrowed":    books_borrowed,
@@ -481,7 +564,9 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
                 "top_genres":        top_genres,
                 "taste_summary":     taste_summary,
                 "taste_vector":      taste_vec,    # returned to agent for context
-                "books_already_seen": seen_ids     # agent should exclude these
+                "books_already_seen": seen_ids,    # agent should exclude these
+                "cold_start_source": cold_start_source,
+                "user_department":   user_dept,    # "" when not registered with one
             }
 
         except Exception as e:
