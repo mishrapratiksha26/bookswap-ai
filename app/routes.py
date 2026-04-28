@@ -719,7 +719,7 @@ def get_session_messages(session_id: str, user_id: Optional[str] = None) -> list
 def run_react_loop(
     messages: list,
     available_tools: list,
-    max_iterations: int = 7,
+    max_iterations: int = 10,
     rerank_weights: dict = None
 ) -> tuple[str, List[str], int]:
     """
@@ -791,8 +791,26 @@ def run_react_loop(
                 "content": json.dumps(result, default=str)
             })
 
-    # Safety fallback — should rarely trigger with well-formed queries
-    return "Sorry, I wasn't able to complete your request. Please try rephrasing.", tools_called, max_iterations
+    # Safety fallback — only fires when the agent loop genuinely cannot
+    # converge on a final answer within max_iterations. The pilot user-
+    # test session triggered this once on a "ref book for fluid machines
+    # course" query, and without the diagnostic line below we could not
+    # tell whether the agent had been stuck looping on one tool, calling
+    # tools sequentially that should have been parallel, or getting
+    # confused by an empty inventory result. Now we print the full tool-
+    # call trail and the last few message roles so future debugging on
+    # Render logs is one log-grep away.
+    last_roles = [m.get("role") for m in messages[-6:]]
+    print(
+        f"AGENT MAX-ITERATIONS HIT — tools_called={tools_called!r} "
+        f"last_message_roles={last_roles!r} max_iterations={max_iterations}",
+        flush=True,
+    )
+    return (
+        "Sorry, I wasn't able to complete your request. Please try rephrasing.",
+        tools_called,
+        max_iterations,
+    )
 
 # ---------------------------------------------------------------------------
 # AGENT ENDPOINT
