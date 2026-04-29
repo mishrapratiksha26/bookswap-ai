@@ -952,8 +952,18 @@ def run_react_loop(
         f"last_message_roles={last_roles!r} max_iterations={max_iterations}",
         flush=True,
     )
+    # Friendlier safety message — the previous "please try rephrasing"
+    # was unhelpful for the study-help failure mode (user asks "what
+    # should I study for tomorrow's wastewater engineering quiz" and
+    # the agent loops because no wastewater engineering material is
+    # in inventory). Point them at the curriculum upload, which is
+    # the actual path that solves their problem.
     return (
-        "Sorry, I wasn't able to complete your request. Please try rephrasing.",
+        "I couldn't find enough material in BookSwap's library to fully "
+        "answer that. If you're studying for a course, try uploading your "
+        "lecture plan PDF on the Curriculum page (/curriculum) — the "
+        "system maps each unit to specific chapters in the professor's "
+        "recommended textbooks. Otherwise please rephrase your question.",
         tools_called,
         max_iterations,
         cited_resources,
