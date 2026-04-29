@@ -1314,6 +1314,82 @@ def map_units_to_chapters(
 
     results = []
 
+    def _build_option(candidate, candidate_type, score, source):
+        """
+        Construct one book_option dict (the chapter, twin, formats, and
+        match metadata) for a single candidate book OR PDF against the
+        current `unit_title` / `topic_vec`.  Closes over the loop variables
+        so the main per-unit body stays readable.
+
+        Returned shape mirrors the historical top-level fields of a
+        unit_match (book_title, suggested_chapter, formats_available, …)
+        so the same dict can serve as either the primary pick OR an
+        entry in `book_options[]` without restructuring downstream.
+        """
+        twin = _find_twin(candidate, candidate_type,
+                          books_with_vectors, pdfs_with_vectors)
+
+        # formats_available — same logic as before, just per-candidate
+        fmt_list = []
+        if candidate_type == "physical":
+            fmt_list.append({
+                "type":      "physical",
+                "book_id":   str(candidate.get("_id", "")),
+                "available": candidate.get("available", True),
+            })
+            if twin:
+                fmt_list.append({
+                    "type":           "pdf",
+                    "pdf_id":         str(twin.get("_id", "")),
+                    "cloudinary_url": twin.get("cloudinary_url", ""),
+                    "page_accurate":  True,
+                })
+        else:  # candidate_type == "pdf"
+            fmt_list.append({
+                "type":           "pdf",
+                "pdf_id":         str(candidate.get("_id", "")),
+                "cloudinary_url": candidate.get("cloudinary_url", ""),
+                "page_accurate":  True,
+            })
+            if twin:
+                fmt_list.append({
+                    "type":      "physical",
+                    "book_id":   str(twin.get("_id", "")),
+                    "available": twin.get("available", True),
+                })
+
+        # Chapter source: prefer PDF twin (get_toc → real page numbers)
+        chap_src_book = candidate
+        chap_src_type = candidate_type
+        if candidate_type == "physical" and twin and twin.get("chapter_headings"):
+            chap_src_book = twin
+            chap_src_type = "pdf"
+
+        chap = find_best_chapter(topic_vec, chap_src_book, unit_title=unit_title)
+        chap_conf = "high"
+        if not chap["title"] or chap["score"] < CHAPTER_CONFIDENCE_THRESHOLD:
+            estimate = estimate_chapter_with_groq(
+                candidate.get("title", ""),
+                candidate.get("author", "") or candidate.get("professor", ""),
+                unit_title,
+            )
+            if estimate["title"]:
+                chap          = {"title": estimate["title"], "page": None, "score": 0.0}
+                chap_src_type = "ai_guess"
+                chap_conf     = estimate["confidence"]
+
+        return {
+            "book_title":         candidate.get("title", ""),
+            "book_author":        candidate.get("author", "") or candidate.get("professor", ""),
+            "source":             source,
+            "match_score":        round(score, 4),
+            "formats_available":  fmt_list,
+            "suggested_chapter":  chap["title"],
+            "chapter_page":       chap["page"],
+            "chapter_source":     chap_src_type,
+            "chapter_confidence": chap_conf,
+        }
+
     for unit in units:
         unit_title = unit.get("title", "")
         if not unit_title:
@@ -1321,78 +1397,83 @@ def map_units_to_chapters(
 
         topic_vec = np.array([generate_embedding(unit_title)])
 
+        # --- Priority 1: build ONE option per professor-recommended book/PDF --
+        # When the lecture plan recommends multiple textbooks AND multiple
+        # are in our inventory, the student is given chapter+page lookups
+        # for EACH and chooses where to read from — rather than the system
+        # collapsing to a single "best" book. (Thesis §1.4, §3.6.2, §4.5.2.)
+        book_options: list[dict] = []
+
+        for book in preferred_books:
+            score = float(cosine_similarity(topic_vec, np.array([book["vector"]]))[0][0])
+            book_options.append(
+                _build_option(book, "physical", score, "professor_recommended")
+            )
+        for pdf in preferred_pdfs:
+            score = float(cosine_similarity(topic_vec, np.array([pdf["embedding"]]))[0][0])
+            book_options.append(
+                _build_option(pdf, "pdf", score, "professor_recommended")
+            )
+
+        if book_options:
+            # Deduplicate by book title — twin detection inside _build_option
+            # already merges the physical+PDF copies of one book into a single
+            # `formats_available` entry.  But if BOTH a physical listing AND a
+            # PDF listing of the same recommended book are independently in
+            # `preferred_books`/`preferred_pdfs`, we'd otherwise show them as
+            # two options.  Keep the higher-scoring one.
+            seen: dict[str, dict] = {}
+            for opt in book_options:
+                key = (opt["book_title"] or "").strip().lower()
+                if not key:
+                    continue
+                prev = seen.get(key)
+                if prev is None or opt["match_score"] > prev["match_score"]:
+                    seen[key] = opt
+            book_options = sorted(
+                seen.values(), key=lambda o: o["match_score"], reverse=True
+            )
+
+            primary = book_options[0]
+            results.append({
+                "unit_no":      unit.get("unit_no", ""),
+                "unit_title":   unit_title,
+                **primary,
+                "book_options": book_options,
+            })
+            continue
+
+        # --- Priority 2: fallback — argmax over the entire inventory ---------
         chosen_book  = None
         chosen_score = 0.0
         chosen_type  = "physical"
-        source       = "ai_suggested"
 
-        # --- Priority 1: professor-recommended (physical OR PDF) ---
-        for book in preferred_books:
-            book_vec = np.array([book["vector"]])
-            score = float(cosine_similarity(topic_vec, book_vec)[0][0])
+        for book in books_with_vectors:
+            score = float(cosine_similarity(topic_vec, np.array([book["vector"]]))[0][0])
             if score > chosen_score:
-                chosen_score = score
-                chosen_book  = book
-                chosen_type  = "physical"
-                source       = "professor_recommended"
-
-        for pdf in preferred_pdfs:
-            pdf_vec = np.array([pdf["embedding"]])
-            score = float(cosine_similarity(topic_vec, pdf_vec)[0][0])
+                chosen_score = score; chosen_book = book; chosen_type = "physical"
+        for pdf in pdfs_with_vectors:
+            score = float(cosine_similarity(topic_vec, np.array([pdf["embedding"]]))[0][0])
             if score > chosen_score:
-                chosen_score = score
-                chosen_book  = pdf
-                chosen_type  = "pdf"
-                source       = "professor_recommended"
+                chosen_score = score; chosen_book = pdf; chosen_type = "pdf"
 
-        # --- Priority 2: fallback — any physical or PDF in inventory ---
-        if not chosen_book:
-            for book in books_with_vectors:
-                book_vec = np.array([book["vector"]])
-                score = float(cosine_similarity(topic_vec, book_vec)[0][0])
-                if score > chosen_score:
-                    chosen_score = score
-                    chosen_book  = book
-                    chosen_type  = "physical"
-                    source       = "ai_suggested"
-
-            for pdf in pdfs_with_vectors:
-                pdf_vec = np.array([pdf["embedding"]])
-                score = float(cosine_similarity(topic_vec, pdf_vec)[0][0])
-                if score > chosen_score:
-                    chosen_score = score
-                    chosen_book  = pdf
-                    chosen_type  = "pdf"
-                    source       = "ai_suggested"
-
-            # Stage-2 LLM judge on the AI-suggested fallback (Chapter 3 §3.6).
-            # Added after user testing surfaced an Object-Oriented-Programming
-            # lecture plan being matched to "Operating System Concepts" purely
-            # because (a) prof's actual OOP textbooks were not in the library
-            # and (b) cosine argmax over the OS-heavy inventory still returned
-            # a winner at 0.43 sim. The LLM judge reads the unit title and the
-            # candidate book title in natural language and rejects matches
-            # that share keywords but not subject. When it rejects, we drop
-            # the suggestion entirely so the UI shows "no relevant book in
-            # inventory" rather than a confidently-labeled wrong-domain pick.
-            if chosen_book is not None:
-                judgement = llm_judge_match(
-                    query=unit_title,
-                    candidates=[{
-                        "title":   chosen_book.get("title", ""),
-                        "authors": chosen_book.get("author", "") or chosen_book.get("professor", ""),
-                    }],
-                    kind="book",
-                )
-                if judgement["match_index"] is None:
-                    chosen_book  = None
-                    chosen_score = 0.0
+        # Stage-2 LLM judge on the AI-suggested fallback (Chapter 3 §3.6).
+        # Rejects same-keyword/different-domain matches (the OOP-plan-vs-OS-
+        # textbook failure surfaced in pilot testing).
+        if chosen_book is not None:
+            judgement = llm_judge_match(
+                query=unit_title,
+                candidates=[{
+                    "title":   chosen_book.get("title", ""),
+                    "authors": chosen_book.get("author", "") or chosen_book.get("professor", ""),
+                }],
+                kind="book",
+            )
+            if judgement["match_index"] is None:
+                chosen_book  = None
+                chosen_score = 0.0
 
         if not chosen_book:
-            # Emit an empty unit-match record so the frontend can render
-            # "no relevant book found in our inventory for this unit" rather
-            # than silently dropping the unit (which made the OOP plan look
-            # half-broken — units 5+ were missing entirely from the result).
             results.append({
                 "unit_no":            unit.get("unit_no", ""),
                 "unit_title":         unit_title,
@@ -1406,78 +1487,16 @@ def map_units_to_chapters(
                 "chapter_source":     "none",
                 "chapter_confidence": "low",
                 "no_match_reason":    "No book in our inventory closely matches this unit's topic.",
+                "book_options":       [],
             })
             continue
 
-        # --- Twin detection: same book in the OTHER collection? ---
-        twin = _find_twin(chosen_book, chosen_type,
-                          books_with_vectors, pdfs_with_vectors)
-
-        # --- Build formats_available list (what student can access) ---
-        formats = []
-        if chosen_type == "physical":
-            formats.append({
-                "type":      "physical",
-                "book_id":   str(chosen_book.get("_id", "")),
-                "available": chosen_book.get("available", True),
-            })
-            if twin:
-                formats.append({
-                    "type":           "pdf",
-                    "pdf_id":         str(twin.get("_id", "")),
-                    "cloudinary_url": twin.get("cloudinary_url", ""),
-                    "page_accurate":  True,
-                })
-        else:  # chosen_type == "pdf"
-            formats.append({
-                "type":           "pdf",
-                "pdf_id":         str(chosen_book.get("_id", "")),
-                "cloudinary_url": chosen_book.get("cloudinary_url", ""),
-                "page_accurate":  True,
-            })
-            if twin:
-                formats.append({
-                    "type":      "physical",
-                    "book_id":   str(twin.get("_id", "")),
-                    "available": twin.get("available", True),
-                })
-
-        # --- Pick chapter source: prefer PDF (get_toc → real page numbers) ---
-        chapter_source_book = chosen_book
-        chapter_source_type = chosen_type
-        if chosen_type == "physical" and twin and twin.get("chapter_headings"):
-            chapter_source_book = twin
-            chapter_source_type = "pdf"
-
-        chapter = find_best_chapter(topic_vec, chapter_source_book, unit_title=unit_title)
-
-        # --- Tier 3: Groq fallback if TOC/heuristic gave weak or no match ---
-        chapter_confidence = "high"  # "high" = TOC/heuristic hit, "low"/"medium" = AI guess
-        if not chapter["title"] or chapter["score"] < CHAPTER_CONFIDENCE_THRESHOLD:
-            estimate = estimate_chapter_with_groq(
-                chosen_book.get("title", ""),
-                chosen_book.get("author", "") or chosen_book.get("professor", ""),
-                unit_title,
-            )
-            if estimate["title"]:
-                chapter = {"title": estimate["title"], "page": None, "score": 0.0}
-                chapter_source_type = "ai_guess"
-                chapter_confidence  = estimate["confidence"]
-            # If Groq also returned nothing, leave chapter empty — frontend will say
-            # "no chapter info available, book is still listed as available."
-
+        primary = _build_option(chosen_book, chosen_type, chosen_score, "ai_suggested")
         results.append({
-            "unit_no":            unit.get("unit_no", ""),
-            "unit_title":         unit_title,
-            "book_title":         chosen_book.get("title", ""),
-            "book_author":        chosen_book.get("author", "") or chosen_book.get("professor", ""),
-            "source":             source,
-            "match_score":        round(chosen_score, 4),
-            "formats_available":  formats,
-            "suggested_chapter":  chapter["title"],
-            "chapter_page":       chapter["page"],
-            "chapter_source":     chapter_source_type,   # "pdf" | "physical" | "ai_guess"
-            "chapter_confidence": chapter_confidence,    # "high" | "medium" | "low"
+            "unit_no":      unit.get("unit_no", ""),
+            "unit_title":   unit_title,
+            **primary,
+            "book_options": [primary],
         })
 
     return results
