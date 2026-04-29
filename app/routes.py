@@ -1532,7 +1532,6 @@ async def compress_pdf(file: UploadFile = File(...)):
             deflate_fonts=True,  # compress embedded fonts
             clean=True,          # remove redundant content
         )
-        doc.close()
         compressed = out.getvalue()
     except Exception as e:
         return JSONResponse(
@@ -1541,22 +1540,61 @@ async def compress_pdf(file: UploadFile = File(...)):
         )
 
     if len(compressed) <= target_bytes:
+        doc.close()
         return Response(content=compressed, media_type="application/pdf")
 
-    # Lossless wasn't enough. Refuse rather than silently degrade.
+    # ----------------------------------------------------------------------
+    # Lossless wasn't enough.  Try lossy fallback IFF the PDF has no
+    # extractable text (i.e. it's already an image-only scan, so we have
+    # nothing to lose by re-encoding pages as JPEGs at lower DPI).
+    #
+    # Real text-bearing PDFs we refuse — re-rendering them as images would
+    # break the curriculum matcher's text extraction step (§3.6.2). For
+    # scan-only PDFs we render each page at 100 DPI (down from the typical
+    # 200-300 DPI source) which is still fully readable on a laptop screen
+    # but cuts file size 4-6x.
+    # ----------------------------------------------------------------------
+    has_text = False
+    sample_pages = min(5, doc.page_count)
+    for i in range(sample_pages):
+        if doc[i].get_text().strip():
+            has_text = True
+            break
+
+    if not has_text:
+        try:
+            new_doc = fitz.open()  # empty
+            for page in doc:
+                pix = page.get_pixmap(dpi=100)
+                jpeg_bytes = pix.tobytes("jpeg", jpg_quality=70)
+                new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(new_page.rect, stream=jpeg_bytes)
+            out2 = io.BytesIO()
+            new_doc.save(out2, garbage=4, deflate=True, clean=True)
+            new_doc.close()
+            lossy = out2.getvalue()
+            if len(lossy) <= target_bytes:
+                doc.close()
+                return Response(content=lossy, media_type="application/pdf")
+        except Exception as e:
+            print(f"Lossy fallback failed: {type(e).__name__}: {e}", flush=True)
+            # fall through to the 413 below
+
+    doc.close()
     return JSONResponse(
         status_code=413,
         content={
-            "error": "PDF still exceeds 10 MB after lossless compression",
+            "error":         "PDF still exceeds 10 MB after compression",
             "original_mb":   round(original_size / 1024 / 1024, 1),
             "compressed_mb": round(len(compressed)  / 1024 / 1024, 1),
             "limit_mb":      10,
+            "has_text":      has_text,
             "suggestion": (
                 "Use a desktop tool such as iLovePDF, Smallpdf, or Adobe "
                 "Acrobat's compression preset to reduce the file further "
-                "before uploading. Aggressive in-pipeline compression would "
-                "render the PDF as images and break the curriculum-matcher's "
-                "text-extraction step."
+                "before uploading. We don't downsample text-bearing PDFs "
+                "in-pipeline because that would break the curriculum-"
+                "matcher's text-extraction step."
             ),
         },
     )
