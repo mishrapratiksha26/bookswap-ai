@@ -236,6 +236,27 @@ tools = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_course_resources",
+            "description": "Find peer-uploaded notes, past papers, and reference material specifically tagged to a named IIT (ISM) course. Call this whenever the user mentions a course they are studying for — by full name ('wastewater engineering', 'operating systems'), by code ('CE503', 'MCC510'), or with study-prep intent ('I have a quiz on X', 'midsem for Y', 'units 1-2 of Z'). This tool returns ONLY resources whose `course` tag matches; it is more precise than search_pdfs because it filters on structured metadata rather than embeddings, and surfaces both digital PDFs and physical notes in one call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "course_name": {
+                        "type": "string",
+                        "description": "Course name as the user said it, e.g. 'wastewater engineering' or 'operating systems'. Required if course_code unknown."
+                    },
+                    "course_code": {
+                        "type": "string",
+                        "description": "Optional course code if user mentioned one, e.g. 'CE503', 'MCC510'."
+                    }
+                },
+                "required": ["course_name"]
+            }
+        }
     }
 ]
 
@@ -646,6 +667,46 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
                 "description": pdf.get("description", ""),
             })
         return results
+
+    elif tool_name == "find_course_resources":
+        # ------------------------------------------------------------------
+        # Course-tagged resource lookup. Wraps find_course_related_notes
+        # (chapter_extractor.py §A.6) so the agent can answer queries like
+        # "I have a quiz on wastewater engineering tomorrow, units 1-2".
+        # The function filters PDFs and physical-notes/PYQ books by their
+        # `course` tag — far more precise than embedding similarity for
+        # named-course questions.
+        #
+        # Returns a flat list of {_id, title, source_type, course,
+        # resource_type, cloudinary_url, ...} dicts. Empty list when no
+        # peers have uploaded material for that course yet — the agent's
+        # R10 protocol then guides the user to upload their lecture plan
+        # via /curriculum.
+        # ------------------------------------------------------------------
+        from app.chapter_extractor import find_course_related_notes
+        course_name = (tool_args.get("course_name") or "").strip()
+        course_code = (tool_args.get("course_code") or "").strip()
+        if not (course_name or course_code):
+            return []
+        all_pdfs  = list(db["pdfs"].find({}))
+        all_books = list(books_collection.find({}))
+        matches = find_course_related_notes(
+            course_name=course_name,
+            course_code=course_code,
+            department="",
+            pdfs=all_pdfs,
+            books=all_books,
+            limit_per_type=3,
+        )
+        # Normalise the shape so the cited_resources extractor picks up
+        # both pdf_id and book_id forms cleanly. We expose `_id` on each
+        # row for downstream linkification.
+        for m in matches:
+            if m.get("source_type") == "pdf":
+                m["_id"] = m.get("pdf_id")
+            else:
+                m["_id"] = m.get("book_id")
+        return matches
 
     return {"error": f"Unknown tool: {tool_name}"}
 
