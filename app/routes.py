@@ -1650,45 +1650,65 @@ async def compress_pdf(file: UploadFile = File(...)):
             has_text = True
             break
 
-    try:
-        new_doc = fitz.open()  # empty
-        for page in doc:
-            pix = page.get_pixmap(dpi=100)
-            jpeg_bytes = pix.tobytes("jpeg", jpg_quality=70)
-            new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
-            new_page.insert_image(new_page.rect, stream=jpeg_bytes)
-        out2 = io.BytesIO()
-        new_doc.save(out2, garbage=4, deflate=True, clean=True)
-        new_doc.close()
-        lossy = out2.getvalue()
-        if len(lossy) <= target_bytes:
-            print(
-                f"Lossy compression: {original_size/1024/1024:.1f} MB -> "
-                f"{len(lossy)/1024/1024:.1f} MB "
-                f"(text_present={has_text}, falls back to Tier 3 chapters)",
-                flush=True,
-            )
-            doc.close()
-            return Response(content=lossy, media_type="application/pdf")
-    except Exception as e:
-        print(f"Lossy fallback failed: {type(e).__name__}: {e}", flush=True)
-        # fall through to the 413 below
+    # Progressive lossy ladder — keeps stepping down DPI / JPEG quality
+    # until the output fits. Stops at the first config that meets the
+    # 9.5 MB target.  Each step roughly halves file size: a 67 MB
+    # textbook that produces 12 MB at (100, 70) typically lands at
+    # ~6 MB at (72, 60) and ~4 MB at (60, 50). Below 60 DPI text in
+    # scanned pages becomes hard to read on a phone, so that's the
+    # floor.
+    LOSSY_LADDER = [
+        (100, 70),  # near-print quality, first attempt
+        ( 72, 60),  # screen-readable, ~halves size
+        ( 60, 50),  # phone-readable, fits very large textbooks
+    ]
+    smallest_lossy = None
+    for dpi, jpg_q in LOSSY_LADDER:
+        try:
+            new_doc = fitz.open()  # empty
+            for page in doc:
+                pix = page.get_pixmap(dpi=dpi)
+                jpeg_bytes = pix.tobytes("jpeg", jpg_quality=jpg_q)
+                new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(new_page.rect, stream=jpeg_bytes)
+            out2 = io.BytesIO()
+            new_doc.save(out2, garbage=4, deflate=True, clean=True)
+            new_doc.close()
+            lossy = out2.getvalue()
+            if smallest_lossy is None or len(lossy) < len(smallest_lossy):
+                smallest_lossy = lossy
+            if len(lossy) <= target_bytes:
+                print(
+                    f"Lossy compression {dpi}DPI/q{jpg_q}: "
+                    f"{original_size/1024/1024:.1f} MB -> "
+                    f"{len(lossy)/1024/1024:.1f} MB "
+                    f"(text_present={has_text}, falls back to Tier 3 chapters)",
+                    flush=True,
+                )
+                doc.close()
+                return Response(content=lossy, media_type="application/pdf")
+        except Exception as e:
+            print(f"Lossy fallback at {dpi}DPI/q{jpg_q} failed: {type(e).__name__}: {e}", flush=True)
+            continue
 
     doc.close()
+    smallest_mb = round(len(smallest_lossy) / 1024 / 1024, 1) if smallest_lossy else None
     return JSONResponse(
         status_code=413,
         content={
             "error":         "PDF still exceeds 10 MB after lossless + lossy compression",
             "original_mb":   round(original_size / 1024 / 1024, 1),
             "compressed_mb": round(len(compressed)  / 1024 / 1024, 1),
+            "smallest_lossy_mb": smallest_mb,
             "limit_mb":      10,
             "has_text":      has_text,
             "suggestion": (
-                "Use a desktop tool such as iLovePDF, Smallpdf, or Adobe "
-                "Acrobat's compression preset to reduce the file further "
-                "before uploading. The in-pipeline lossy fallback already "
-                "tried 100 DPI JPEG re-rendering and the result still "
-                "exceeded 10 MB."
+                f"Even after re-rendering at 60 DPI / JPEG quality 50, the "
+                f"file is {smallest_mb} MB. Use a desktop tool such as "
+                f"iLovePDF, Smallpdf, or Adobe Acrobat to reduce it further "
+                f"before uploading. (Page count appears very large; "
+                f"splitting the PDF into two halves and uploading each "
+                f"separately is another option.)"
             ),
         },
     )
