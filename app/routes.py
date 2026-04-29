@@ -891,6 +891,29 @@ def run_react_loop(
             print(f"GROQ ERROR: {error_msg}")
             if "rate_limit" in error_msg or "429" in error_msg:
                 return "I'm a bit busy right now, please try again in a few minutes!", tools_called, iteration, cited_resources
+            # tool_use_failed = Llama 3.3 emitted a legacy <function=...>
+            # XML-style tool call inside `content` instead of using Groq's
+            # structured tool_calls field. Groq 400s it. Retrying with the
+            # same prompt produces the same broken output deterministically,
+            # so a `continue` here just burns tokens — the user-test session
+            # consumed ~100K tokens (the entire daily Groq quota) inside a
+            # single max-iterations loop on this exact error. Bail out
+            # immediately with a graceful response instead.
+            if "tool_use_failed" in error_msg or "Failed to call a function" in error_msg:
+                print(
+                    f"AGENT TOOL-USE-FAILED — bailing out on iteration {iteration} "
+                    f"to avoid token-burn loop", flush=True,
+                )
+                return (
+                    "I'm having trouble understanding which resources to look up "
+                    "for that question. Could you rephrase a bit more concretely "
+                    "— e.g. 'Find me textbooks on wastewater treatment' — or "
+                    "upload your lecture plan on the Curriculum page so I can "
+                    "map each unit to specific chapters?",
+                    tools_called,
+                    iteration,
+                    cited_resources,
+                )
             continue
 
         msg = response.choices[0].message
@@ -1544,15 +1567,20 @@ async def compress_pdf(file: UploadFile = File(...)):
         return Response(content=compressed, media_type="application/pdf")
 
     # ----------------------------------------------------------------------
-    # Lossless wasn't enough.  Try lossy fallback IFF the PDF has no
-    # extractable text (i.e. it's already an image-only scan, so we have
-    # nothing to lose by re-encoding pages as JPEGs at lower DPI).
+    # Lossless wasn't enough.  Always try lossy fallback now: re-render
+    # each page at 100 DPI as JPEG (q=70) and reassemble.  This typically
+    # cuts a 67 MB scanned/embedded-image textbook to ~6 MB.
     #
-    # Real text-bearing PDFs we refuse — re-rendering them as images would
-    # break the curriculum matcher's text extraction step (§3.6.2). For
-    # scan-only PDFs we render each page at 100 DPI (down from the typical
-    # 200-300 DPI source) which is still fully readable on a laptop screen
-    # but cuts file size 4-6x.
+    # Trade-off: lossy-compressing a text-bearing PDF strips its
+    # extractable text, which means the curriculum matcher cannot use
+    # PyMuPDF.get_toc() on this specific upload (Tier 2 of §3.6.3) and
+    # falls back to LLM-generated chapter structure from book title +
+    # author + description (Tier 3).  Tier 3 is documented as a
+    # graceful-degradation path in the thesis — chapter titles without
+    # page numbers — so this is a documented quality drop, not a
+    # regression.  The earlier "refuse text-bearing PDFs" policy left
+    # users stuck on 50+ MB textbooks with no path to upload, which is
+    # worse than a Tier 3 chapter list.
     # ----------------------------------------------------------------------
     has_text = False
     sample_pages = min(5, doc.page_count)
@@ -1561,30 +1589,35 @@ async def compress_pdf(file: UploadFile = File(...)):
             has_text = True
             break
 
-    if not has_text:
-        try:
-            new_doc = fitz.open()  # empty
-            for page in doc:
-                pix = page.get_pixmap(dpi=100)
-                jpeg_bytes = pix.tobytes("jpeg", jpg_quality=70)
-                new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
-                new_page.insert_image(new_page.rect, stream=jpeg_bytes)
-            out2 = io.BytesIO()
-            new_doc.save(out2, garbage=4, deflate=True, clean=True)
-            new_doc.close()
-            lossy = out2.getvalue()
-            if len(lossy) <= target_bytes:
-                doc.close()
-                return Response(content=lossy, media_type="application/pdf")
-        except Exception as e:
-            print(f"Lossy fallback failed: {type(e).__name__}: {e}", flush=True)
-            # fall through to the 413 below
+    try:
+        new_doc = fitz.open()  # empty
+        for page in doc:
+            pix = page.get_pixmap(dpi=100)
+            jpeg_bytes = pix.tobytes("jpeg", jpg_quality=70)
+            new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+            new_page.insert_image(new_page.rect, stream=jpeg_bytes)
+        out2 = io.BytesIO()
+        new_doc.save(out2, garbage=4, deflate=True, clean=True)
+        new_doc.close()
+        lossy = out2.getvalue()
+        if len(lossy) <= target_bytes:
+            print(
+                f"Lossy compression: {original_size/1024/1024:.1f} MB -> "
+                f"{len(lossy)/1024/1024:.1f} MB "
+                f"(text_present={has_text}, falls back to Tier 3 chapters)",
+                flush=True,
+            )
+            doc.close()
+            return Response(content=lossy, media_type="application/pdf")
+    except Exception as e:
+        print(f"Lossy fallback failed: {type(e).__name__}: {e}", flush=True)
+        # fall through to the 413 below
 
     doc.close()
     return JSONResponse(
         status_code=413,
         content={
-            "error":         "PDF still exceeds 10 MB after compression",
+            "error":         "PDF still exceeds 10 MB after lossless + lossy compression",
             "original_mb":   round(original_size / 1024 / 1024, 1),
             "compressed_mb": round(len(compressed)  / 1024 / 1024, 1),
             "limit_mb":      10,
@@ -1592,9 +1625,9 @@ async def compress_pdf(file: UploadFile = File(...)):
             "suggestion": (
                 "Use a desktop tool such as iLovePDF, Smallpdf, or Adobe "
                 "Acrobat's compression preset to reduce the file further "
-                "before uploading. We don't downsample text-bearing PDFs "
-                "in-pipeline because that would break the curriculum-"
-                "matcher's text-extraction step."
+                "before uploading. The in-pipeline lossy fallback already "
+                "tried 100 DPI JPEG re-rendering and the result still "
+                "exceeded 10 MB."
             ),
         },
     )
