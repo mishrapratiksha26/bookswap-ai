@@ -118,6 +118,15 @@ class AgentResponse(BaseModel):
     session_id: str          # echoed back so the frontend can store it
     tools_called: List[str]  # ordered list: e.g. ["semantic_search", "check_availability"]
     iterations: int          # how many loop cycles ran — used in Chapter 5 evaluation
+    # Books / PDFs that came back from any tool call during this turn,
+    # captured so the chat widget can hyperlink any of these titles
+    # appearing in the agent's free-text response.  Each item:
+    #   {id: "<mongo objectid string>", title: "...", type: "book"|"pdf"}
+    # User feedback from Shweta's session: "could you include links of
+    # these books so when I click on the book name I can directly go
+    # to borrow it" — this is the wire-side half of that fix; the
+    # client-side linkifier consumes this list.
+    cited_resources: List[dict] = []
 
 # ---------------------------------------------------------------------------
 # TOOL DEFINITIONS — 5 tools total.
@@ -801,22 +810,70 @@ def get_session_messages(session_id: str, user_id: Optional[str] = None) -> list
 # Returns: (response_text, tools_called, iteration_count)
 # ---------------------------------------------------------------------------
 
+def _extract_cited(tool_name: str, result) -> list[dict]:
+    """
+    Pull {id, title, type} triples out of a tool result so the chat
+    widget can hyperlink any of those titles when they appear in the
+    agent's free-text response.
+
+    Best-effort — only handles tool results whose items are dicts with
+    a recognisable id+title shape.  Tool results that don't fit
+    (get_user_profile's taste-vector payload, etc.) just return [].
+    """
+    cited: list[dict] = []
+    if not isinstance(result, list):
+        return cited
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        if not title:
+            continue
+        if tool_name == "search_pdfs" or "pdf_id" in item or "cloudinary_url" in item:
+            obj_id = item.get("pdf_id") or item.get("_id")
+            kind   = "pdf"
+        else:
+            obj_id = item.get("book_id") or item.get("_id")
+            kind   = "book"
+        if obj_id and title:
+            cited.append({
+                "id":    str(obj_id),
+                "title": str(title),
+                "type":  kind,
+            })
+    return cited
+
+
 def run_react_loop(
     messages: list,
     available_tools: list,
     max_iterations: int = 10,
     rerank_weights: dict = None
-) -> tuple[str, List[str], int]:
+) -> tuple[str, List[str], int, list[dict]]:
     """
     Core ReAct agent loop (Yao et al. 2022).
 
     State tracked across iterations:
-      taste_vector — set when get_user_profile is called; threaded into
-                     subsequent semantic_search calls for personalised re-ranking.
-                     This is what makes the agent profile-aware without hardcoding.
+      taste_vector    — set when get_user_profile is called; threaded
+                        into subsequent semantic_search calls for
+                        personalised re-ranking.
+      cited_resources — every {id, title, type} triple seen in any
+                        tool result during this turn, deduplicated by
+                        id, returned to the caller so the frontend can
+                        linkify those titles in the final response.
+
+    Returns: (response_text, tools_called, iterations, cited_resources)
     """
-    tools_called = []
+    tools_called: list[str]    = []
+    cited_resources: list[dict] = []
     taste_vector = None   # updated when get_user_profile runs
+
+    def _add_cited(items: list[dict]):
+        seen_ids = {c["id"] for c in cited_resources}
+        for c in items:
+            if c["id"] not in seen_ids:
+                cited_resources.append(c)
+                seen_ids.add(c["id"])
 
     for iteration in range(1, max_iterations + 1):
         print(f"\n--- Iteration {iteration} ---")
@@ -833,7 +890,7 @@ def run_react_loop(
             error_msg = str(e)
             print(f"GROQ ERROR: {error_msg}")
             if "rate_limit" in error_msg or "429" in error_msg:
-                return "I'm a bit busy right now, please try again in a few minutes!", tools_called, iteration
+                return "I'm a bit busy right now, please try again in a few minutes!", tools_called, iteration, cited_resources
             continue
 
         msg = response.choices[0].message
@@ -842,7 +899,7 @@ def run_react_loop(
         if not msg.tool_calls:
             preview = (msg.content or '')[:200].encode('ascii', errors='replace').decode('ascii')
             print(f"FINAL: {preview}")
-            return msg.content or "I couldn't find an answer. Please try again.", tools_called, iteration
+            return msg.content or "I couldn't find an answer. Please try again.", tools_called, iteration, cited_resources
 
         # Append assistant message (with its tool_calls) to conversation history
         messages.append(msg)
@@ -867,6 +924,10 @@ def run_react_loop(
             # subsequent semantic_search calls in this same session
             if tool_name == "get_user_profile" and isinstance(result, dict):
                 taste_vector = result.get("taste_vector")  # may be None (cold start)
+
+            # Capture any books / PDFs surfaced by this tool call so the
+            # chat widget can render them as clickable links.
+            _add_cited(_extract_cited(tool_name, result))
 
             print(f"RESULT: {json.dumps(result, default=str)[:300]}")
 
@@ -895,6 +956,7 @@ def run_react_loop(
         "Sorry, I wasn't able to complete your request. Please try rephrasing.",
         tools_called,
         max_iterations,
+        cited_resources,
     )
 
 # ---------------------------------------------------------------------------
@@ -941,11 +1003,11 @@ def agent(request: AgentRequest):
     # Run the ReAct loop
     loop_error = None
     try:
-        response_text, tools_called, iterations = run_react_loop(messages, tools)
+        response_text, tools_called, iterations, cited_resources = run_react_loop(messages, tools)
     except Exception as e:
         loop_error = str(e)
-        response_text, tools_called, iterations = (
-            "Sorry, something went wrong. Please try again.", [], 0
+        response_text, tools_called, iterations, cited_resources = (
+            "Sorry, something went wrong. Please try again.", [], 0, []
         )
 
     # Save assistant response to session store
@@ -974,7 +1036,8 @@ def agent(request: AgentRequest):
         response=response_text,
         session_id=session_id,
         tools_called=tools_called,
-        iterations=iterations
+        iterations=iterations,
+        cited_resources=cited_resources,
     )
 
 # ---------------------------------------------------------------------------
@@ -1590,7 +1653,7 @@ def evaluate(request: EvalRequest):
             {"role": "user", "content": query}
         ]
 
-        response_text, tools_called, iterations = run_react_loop(
+        response_text, tools_called, iterations, _cited = run_react_loop(
             messages, tools, max_iterations=5
         )
 
