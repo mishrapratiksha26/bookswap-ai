@@ -257,6 +257,27 @@ tools = [
                 "required": ["course_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_my_curricula",
+            "description": "Retrieve lecture plans (curricula) the logged-in user has previously uploaded on the Curriculum page. Use this WHENEVER the user mentions a course-and-units pattern — e.g. 'rock breakage quiz on units 1 and 2', 'midsem for operating systems', 'syllabus for fluid mechanics' — BEFORE deciding the user has nothing uploaded. Returns the saved curriculum's parsed unit titles, which you can then feed to semantic_search and search_pdfs to surface relevant resources for those specific units. Pass `course_query` to fuzzy-match against saved curricula by course name or code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "MongoDB ObjectId of the logged-in user (provided in the request context)"
+                    },
+                    "course_query": {
+                        "type": "string",
+                        "description": "Optional substring to filter saved curricula by course name or code, e.g. 'rock breakage' or 'CE503'."
+                    }
+                },
+                "required": ["user_id"]
+            }
+        }
     }
 ]
 
@@ -667,6 +688,54 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
                 "description": pdf.get("description", ""),
             })
         return results
+
+    elif tool_name == "get_my_curricula":
+        # ------------------------------------------------------------------
+        # Returns the user's previously-uploaded lecture plans, snapshotted
+        # in the `curricula` collection by Node's POST /curriculum route.
+        # The agent uses this to ground course-and-units study-help queries
+        # like "rock breakage quiz on units 1 and 2" — fetches the parsed
+        # unit titles, then drives subsequent semantic_search /
+        # search_pdfs / find_course_resources calls per unit.
+        # ------------------------------------------------------------------
+        from bson import ObjectId as _OID2
+        user_id = (tool_args.get("user_id") or "").strip()
+        if not user_id:
+            return []
+        course_query = (tool_args.get("course_query") or "").strip().lower()
+        try:
+            cursor = db["curricula"].find(
+                {"user_id": _OID2(user_id)}
+            ).sort("created_at", -1).limit(10)
+        except Exception as e:
+            print(f"get_my_curricula query failed: {e}", flush=True)
+            return []
+        out = []
+        for doc in cursor:
+            cname = (doc.get("course_name") or "").lower()
+            ccode = (doc.get("course_code") or "").lower()
+            # Substring filter on course name OR code (when course_query
+            # given). Empty course_query → return all the user's saved
+            # curricula so the agent can list them.
+            if course_query and course_query not in cname and course_query not in ccode:
+                continue
+            parsed = doc.get("parsed_result") or {}
+            units = parsed.get("units") or []
+            out.append({
+                "_id":         str(doc["_id"]),
+                "course_name": doc.get("course_name", ""),
+                "course_code": doc.get("course_code", ""),
+                "department":  doc.get("department", ""),
+                "units": [
+                    {"unit_no": u.get("unit_no"), "title": u.get("title")}
+                    for u in units
+                    if u.get("title")
+                ],
+                "uploaded_at": doc.get("created_at").isoformat() if doc.get("created_at") else "",
+            })
+            if len(out) >= 5:
+                break
+        return out
 
     elif tool_name == "find_course_resources":
         # ------------------------------------------------------------------
@@ -1088,6 +1157,15 @@ def agent(request: AgentRequest):
     session_history = get_session_messages(session_id, user_id)
 
     messages = [{"role": "system", "content": active_prompt}]
+    # Tell the agent who the logged-in user is so tools that take a
+    # user_id arg (get_user_profile, get_my_curricula) can be invoked
+    # from the very first turn — without this the LLM has no way to
+    # learn user_id until a later tool call surfaces it.
+    if user_id:
+        messages.append({
+            "role": "system",
+            "content": f"[Logged-in user_id: {user_id}]"
+        })
     messages.extend(session_history)
     messages.append({"role": "user", "content": request.message})
 
