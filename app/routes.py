@@ -1661,6 +1661,7 @@ async def compress_pdf(file: UploadFile = File(...)):
         (100, 70),  # near-print quality, first attempt
         ( 72, 60),  # screen-readable, ~halves size
         ( 60, 50),  # phone-readable, fits very large textbooks
+        ( 48, 40),  # rough-but-readable; the floor we're willing to ship
     ]
     smallest_lossy = None
     for dpi, jpg_q in LOSSY_LADDER:
@@ -1703,12 +1704,13 @@ async def compress_pdf(file: UploadFile = File(...)):
             "limit_mb":      10,
             "has_text":      has_text,
             "suggestion": (
-                f"Even after re-rendering at 60 DPI / JPEG quality 50, the "
-                f"file is {smallest_mb} MB. Use a desktop tool such as "
-                f"iLovePDF, Smallpdf, or Adobe Acrobat to reduce it further "
-                f"before uploading. (Page count appears very large; "
-                f"splitting the PDF into two halves and uploading each "
-                f"separately is another option.)"
+                f"Even at our lowest readable quality (48 DPI / JPEG 40), "
+                f"this PDF is {smallest_mb} MB — over our 10 MB cap. The "
+                f"recommended fix is to split the PDF into two halves "
+                f"externally and upload each separately; halves compress "
+                f"to ~6-7 MB each at full near-print quality, and your "
+                f"peers can navigate them faster. iLovePDF and Smallpdf "
+                f"both have free split-PDF tools."
             ),
         },
     )
