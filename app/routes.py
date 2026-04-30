@@ -997,6 +997,11 @@ def run_react_loop(
     tools_called: list[str]    = []
     cited_resources: list[dict] = []
     taste_vector = None   # updated when get_user_profile runs
+    # Single-element list (mutable closure) — flips True after we've
+    # injected the corrective tool-format reminder once. Prevents
+    # injecting the same reminder every iteration if the model
+    # keeps mis-formatting.
+    _tool_format_corrected = [False]
 
     def _add_cited(items: list[dict]):
         seen_ids = {c["id"] for c in cited_resources}
@@ -1021,25 +1026,44 @@ def run_react_loop(
             print(f"GROQ ERROR: {error_msg}")
             if "rate_limit" in error_msg or "429" in error_msg:
                 return "I'm a bit busy right now, please try again in a few minutes!", tools_called, iteration, cited_resources
-            # tool_use_failed = Llama 3.3 emitted a legacy <function=...>
+            # tool_use_failed = Llama 3.3 emitted a legacy <function=NAME{args}>
             # XML-style tool call inside `content` instead of using Groq's
-            # structured tool_calls field. Groq 400s it. Retrying with the
-            # same prompt produces the same broken output deterministically,
-            # so a `continue` here just burns tokens — the user-test session
-            # consumed ~100K tokens (the entire daily Groq quota) inside a
-            # single max-iterations loop on this exact error. Bail out
-            # immediately with a graceful response instead.
+            # structured tool_calls field. Groq 400s it. Plain `continue`
+            # would burn tokens forever (the prior user-test loop consumed
+            # the full 100K daily quota). Inject a corrective system reminder
+            # and retry ONCE — many of these failures fix themselves when
+            # the model re-reads the rule. If the next iteration still hits
+            # tool_use_failed we bail out with a NEUTRAL message (not the
+            # curriculum-prescriptive one) so leisure / personal-rec
+            # queries don't get nonsense advice.
             if "tool_use_failed" in error_msg or "Failed to call a function" in error_msg:
+                if not _tool_format_corrected[0]:
+                    _tool_format_corrected[0] = True
+                    print(
+                        f"AGENT TOOL-USE-FAILED — injecting corrective reminder "
+                        f"and retrying (iteration {iteration})", flush=True,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "REMINDER: Tool calls MUST go through the structured "
+                            "`tool_calls` API field, not as <function=NAME{args}> "
+                            "XML tags inside message content. Either invoke a tool "
+                            "properly or respond directly with text. Do not mix "
+                            "the two formats."
+                        ),
+                    })
+                    continue
                 print(
-                    f"AGENT TOOL-USE-FAILED — bailing out on iteration {iteration} "
-                    f"to avoid token-burn loop", flush=True,
+                    f"AGENT TOOL-USE-FAILED twice — bailing out at iteration "
+                    f"{iteration} (Llama 3.3 tool-format degradation)",
+                    flush=True,
                 )
                 return (
-                    "I'm having trouble understanding which resources to look up "
-                    "for that question. Could you rephrase a bit more concretely "
-                    "— e.g. 'Find me textbooks on wastewater treatment' — or "
-                    "upload your lecture plan on the Curriculum page so I can "
-                    "map each unit to specific chapters?",
+                    "Sorry, I had trouble processing that — could you rephrase "
+                    "the question? I work best with concrete asks like 'find me "
+                    "thrillers I can borrow' or 'recommend self-help books' or "
+                    "'help me study for my [course name] quiz'.",
                     tools_called,
                     iteration,
                     cited_resources,
