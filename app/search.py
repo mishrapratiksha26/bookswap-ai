@@ -1,6 +1,7 @@
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import math
+from datetime import datetime, timezone
 from app.embeddings import generate_embedding
 
 
@@ -36,6 +37,9 @@ def serialize_doc(doc: dict) -> dict:
 # Components:
 #   sim(q,b)      cosine_similarity(embed(q), embed(b))          ∈ [0,1]
 #   avail(b)      1.0 available | 0.3 due ≤7 days | 0.0 unavailable
+#                 (near-return tier fires when the book dict carries
+#                  days_until_return ≤ 7 or expected_return_date within
+#                  the next week; missing data → binary 1.0 / 0.0)
 #   rating(b)     (avg_rating − 1) / 4                           ∈ [0,1]
 #                 0.5 if no ratings (neutral cold-start default)
 #   context(b,u)  cosine_similarity(taste_vec(u), embed(b))      ∈ [0,1]
@@ -100,11 +104,42 @@ def rerank_books(
         # --- Component 1: semantic similarity (already computed) ---
         sim = float(book.get("score", 0.0))
 
-        # --- Component 2: availability ---
+        # --- Component 2: availability (three-tier — thesis §3.3.1) ---
+        #   1.0  currently available
+        #   0.3  due back within 7 days
+        #   0.0  currently borrowed, no near return
+        #
+        # The 0.3 near-return tier requires a return-date signal on the
+        # book dict — preferred source is `days_until_return` (a float),
+        # with `expected_return_date` (ISO string or datetime) as a
+        # fallback that gets converted to days. Callers that don't
+        # populate either field degrade to the original binary
+        # behaviour (1.0 / 0.0), which is correct for any retrieval
+        # path that hasn't joined the borrowRequest collection yet.
         if book.get("available") is True:
             avail = 1.0
         elif book.get("available") is False:
-            avail = 0.0
+            days_until_return = book.get("days_until_return")
+            if days_until_return is None:
+                expected = book.get("expected_return_date")
+                if expected is not None:
+                    try:
+                        if isinstance(expected, str):
+                            expected_dt = datetime.fromisoformat(
+                                expected.replace("Z", "+00:00")
+                            )
+                        else:
+                            expected_dt = expected
+                        if expected_dt.tzinfo is None:
+                            expected_dt = expected_dt.replace(tzinfo=timezone.utc)
+                        delta = expected_dt - datetime.now(timezone.utc)
+                        days_until_return = delta.total_seconds() / 86400
+                    except Exception:
+                        days_until_return = None
+            if days_until_return is not None and 0 <= days_until_return <= 7:
+                avail = 0.3
+            else:
+                avail = 0.0
         else:
             # None / missing field → treat as available (legacy data)
             avail = 1.0
