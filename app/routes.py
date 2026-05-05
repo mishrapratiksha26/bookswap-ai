@@ -674,7 +674,17 @@ def execute_tool(tool_name: str, tool_args: dict, taste_vector=None, rerank_weig
                     "score": round(score, 4)
                 })
             results.sort(key=lambda x: x["score"], reverse=True)
-            return [r for r in results if r["score"] > 0.1][:5]
+            # Threshold 0.35 (empirically chosen, matches the curriculum
+            # chapter-match Pareto knee). Previously 0.1 — too permissive
+            # at the deployment-scale inventory: a query like "thrillers"
+            # against an academic-only PDF library would return DBMS / AI
+            # textbooks with cosine ~0.15-0.25 because they were the
+            # closest matches in vector space, even though they're
+            # genuinely terrible matches. 0.35 lets the agent honestly
+            # report "no relevant PDFs" when nothing in the inventory
+            # matches the query, instead of surfacing noise that the
+            # agent then dutifully renders to the user.
+            return [r for r in results if r["score"] > 0.35][:5]
 
         # Fallback: return first 5 matching by filter (no vector yet)
         results = []
